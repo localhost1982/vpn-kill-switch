@@ -1,0 +1,17 @@
+[Unit]
+Description=VPN kill switch (nftables): internet only via VPN-L2TP
+# Поднимаем правила до того, как NetworkManager начнёт поднимать сеть.
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/killswitch.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/killswitch.nft
+ExecStop=/usr/sbin/nft delete table inet killswitch
+
+[Install]
+WantedBy=multi-user.target

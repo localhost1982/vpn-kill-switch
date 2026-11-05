@@ -1,0 +1,76 @@
+#!/usr/sbin/nft -f
+#
+# VPN kill switch для VPN-L2TP (nm-l2tp: strongSwan + kl2tpd + pppd).
+#
+# Принцип: наружу (Wi-Fi, Ethernet, любой другой физический интерфейс)
+# разрешены только пакеты, нужные для установления самого VPN, и локальная
+# сеть. Весь остальной трафик должен идти через ppp* (туннель VPN-L2TP).
+# Если VPN упал, маршрут по умолчанию возвращается на Wi-Fi, но правила
+# ниже его блокируют. Если VPN "завис" (ppp1 жив, но мёртв), трафик и так
+# уходит в мёртвый туннель и никуда не утекает.
+#
+# Файл идемпотентен: при каждом запуске своя таблица пересоздаётся,
+# чужие таблицы (Docker, ufw) не трогаются. Ничего не flush-ит глобально.
+
+table inet killswitch
+delete table inet killswitch
+
+table inet killswitch {
+
+	# Сервер VPN-L2TP: vpn.example.com. Если у него сменится IP, обновить здесь.
+	set vpn_server {
+		type ipv4_addr
+		elements = { 203.0.113.10 }
+	}
+
+	# Локальные сети, разрешённые без VPN: роутер, локальный DNS,
+	# принтеры, Docker-подсети, mDNS/мультикаст.
+	set lan {
+		type ipv4_addr
+		flags interval
+		elements = {
+			10.0.0.0/8,
+			172.16.0.0/12,
+			192.168.0.0/16,
+			169.254.0.0/16,
+			224.0.0.0/4
+		}
+	}
+
+	chain output {
+		type filter hook output priority filter + 10; policy accept;
+
+		# Интерфейсы, где ограничений нет
+		oifname "lo" accept
+		oifname "ppp*" accept comment "туннель VPN-L2TP"
+		oifname "docker0" accept
+		oifname "br-*" accept comment "сети docker compose"
+		oifname "veth*" accept
+
+		# Всё ниже относится к любому другому интерфейсу:
+		# Wi-Fi, Ethernet, USB-модем, новая сетевуха и т.д.
+
+		udp sport 68 udp dport 67 accept comment "DHCP"
+		ip daddr @vpn_server udp dport { 500, 4500 } accept comment "IKE и IPsec NAT-T до сервера VPN"
+		# L2TP проходит через output ДО шифрования IPsec, как обычный UDP 1701
+		# на адрес сервера. Потом ядро заворачивает его в ESP (UDP 4500).
+		ip daddr @vpn_server udp dport 1701 accept comment "L2TP до шифрования IPsec"
+		ip daddr @lan accept comment "локальная сеть и локальный DNS"
+		ip6 daddr { fe80::/10, ff00::/8 } accept comment "IPv6 link-local (NDP, RA)"
+
+		counter drop comment "KILL SWITCH: интернет без VPN заблокирован"
+	}
+
+	# Трафик, который ноутбук пересылает (Docker-контейнеры наружу).
+	chain forward {
+		type filter hook forward priority filter + 10; policy accept;
+
+		oifname "ppp*" accept
+		oifname "docker0" accept
+		oifname "br-*" accept
+		oifname "veth*" accept
+		ip daddr @lan accept
+
+		counter drop comment "KILL SWITCH: контейнеры без VPN заблокированы"
+	}
+}

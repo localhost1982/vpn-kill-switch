@@ -1,0 +1,15 @@
+# Редакторы и IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Резервные копии и временные файлы
+*.bak
+*.orig
+*.tmp
+
+# ОС
+.DS_Store
+Thumbs.db
