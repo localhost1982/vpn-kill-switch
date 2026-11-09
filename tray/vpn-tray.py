@@ -29,6 +29,7 @@ from gi.repository import Gdk, Gio, GLib, Gtk, NM  # noqa: E402
 from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 
 KILLSWITCH_UNIT = "vpn-killswitch.service"
+WATCHDOG_UNIT = "vpn-watchdog.service"  # user unit (systemctl --user): keeps the selected VPN profile connected
 HELPER = "/usr/local/sbin/vpn-killswitch-server"  # root helper: writes the VPN server IPs for the kill switch
 SETTINGS_PATH = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
@@ -100,6 +101,15 @@ def run(cmd, timeout=5):
     except Exception as e:  # timeout, command not found, etc.
         log("%s: %s" % (" ".join(cmd), e))
         return None, ""
+
+
+def unit_active(argv_prefix, unit):
+    """`<argv_prefix> is-active <unit>`: True if the unit is active, False for any other state,
+    None if systemctl could not be run. argv_prefix is ["systemctl"] or ["systemctl", "--user"]."""
+    rc, out = run([*argv_prefix, "is-active", unit])
+    if rc is None:
+        return None
+    return out.strip() == "active"
 
 
 def run_async(argv, callback, want_stdout=False):
@@ -335,6 +345,32 @@ def vpn_server_hosts(conn):
         if h and h not in out:
             out.append(h)
     return out
+
+
+def switch_row(title, subtitle):
+    """A Settings row: bold title, dim subtitle and a Gtk.Switch on the right. Returns (row, switch)."""
+    title_label = Gtk.Label(halign=Gtk.Align.START, hexpand=True)
+    title_label.set_markup("<b>%s</b>" % title)
+    title_label.set_xalign(0)
+    subtitle_label = Gtk.Label(label=subtitle, halign=Gtk.Align.START, hexpand=True)
+    subtitle_label.get_style_context().add_class("dim-label")
+    subtitle_label.set_line_wrap(True)
+    subtitle_label.set_xalign(0)
+
+    texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+    texts.pack_start(title_label, False, False, 0)
+    texts.pack_start(subtitle_label, False, False, 0)
+
+    switch = Gtk.Switch(valign=Gtk.Align.CENTER, hexpand=False)
+
+    row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+    row_box.set_border_width(12)
+    row_box.pack_start(texts, True, True, 0)
+    row_box.pack_start(switch, False, False, 0)
+
+    row = Gtk.ListBoxRow(activatable=False, can_focus=False)
+    row.add(row_box)
+    return row, switch
 
 
 class Tray:
@@ -631,12 +667,15 @@ class Tray:
 
 
 class SettingsWindow(Gtk.Window):
-    """Settings window: VPN profile and kill switch toggle. Applied by the "Save" button."""
+    """Settings window: VPN profile, kill switch and watchdog toggles. Applied by the "Save" button."""
 
     def __init__(self, tray):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.tray = tray
         self.baseline = False   # kill switch state in the system at open time / last poll
+        self.wd_baseline = False  # watchdog state in the system at open time / after a failed step
+        self.wd_want = False    # the watchdog switch position taken at Save
+        self.wd_changed = False  # whether the watchdog needs a change (set by on_save)
         self.busy = False       # a Save sequence (sudo / nmcli commands) is still running
         self.closed = False
         self.proc = None        # reference to the Gio.Subprocess while it runs
@@ -685,39 +724,23 @@ class SettingsWindow(Gtk.Window):
         vpn_box.pack_start(vpn_texts, True, True, 0)
         vpn_box.pack_start(self.combo, False, False, 0)
 
-        vpn_row = Gtk.ListBoxRow(activatable=False)
+        vpn_row = Gtk.ListBoxRow(activatable=False, can_focus=False)
         vpn_row.add(vpn_box)
 
-        # Row 2: kill switch.
-        title = Gtk.Label(halign=Gtk.Align.START, hexpand=True)
-        title.set_markup("<b>Kill switch</b>")
-        title.set_xalign(0)
-        subtitle = Gtk.Label(
-            label="Block traffic outside the VPN. The setting persists across reboots.",
-            halign=Gtk.Align.START,
-            hexpand=True,
+        # Row 2: kill switch. Row 3: watchdog.
+        row, self.switch = switch_row(
+            "Kill switch",
+            "Block traffic outside the VPN. The setting persists across reboots.",
         )
-        subtitle.get_style_context().add_class("dim-label")
-        subtitle.set_line_wrap(True)
-        subtitle.set_xalign(0)
-
-        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-        texts.pack_start(title, False, False, 0)
-        texts.pack_start(subtitle, False, False, 0)
-
-        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER, hexpand=False)
-
-        row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        row_box.set_border_width(12)
-        row_box.pack_start(texts, True, True, 0)
-        row_box.pack_start(self.switch, False, False, 0)
-
-        row = Gtk.ListBoxRow(activatable=False)
-        row.add(row_box)
+        wd_row, self.switch_wd = switch_row(
+            "Watchdog",
+            "Reconnect the selected VPN profile automatically when it drops.",
+        )
         listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         listbox.get_style_context().add_class("frame")
         listbox.add(vpn_row)
         listbox.add(row)
+        listbox.add(wd_row)
 
         self.error_label = Gtk.Label(halign=Gtk.Align.START)
         self.error_label.set_line_wrap(True)
@@ -749,6 +772,10 @@ class SettingsWindow(Gtk.Window):
         self.tray.refresh_killswitch()
         self.baseline = bool(self.tray.ks_active)
         self.switch.set_active(self.baseline)
+        # The watchdog is a user unit: read it directly (a quick `systemctl --user is-active`).
+        # None (systemctl could not be run) counts as "off". Only the kill switch is re-polled.
+        self.wd_baseline = bool(unit_active(["systemctl", "--user"], WATCHDOG_UNIT))
+        self.switch_wd.set_active(self.wd_baseline)
 
         self.show_all()
 
@@ -782,6 +809,7 @@ class SettingsWindow(Gtk.Window):
 
     def set_controls_sensitive(self, value):
         self.switch.set_sensitive(value)
+        self.switch_wd.set_sensitive(value)
         self.combo.set_sensitive(value and self.has_profiles)
         self.btn_cancel.set_sensitive(value)
         self.btn_save.set_sensitive(value)
@@ -795,7 +823,9 @@ class SettingsWindow(Gtk.Window):
         vpn_changed = new_uuid is not None and new_uuid != self.tray.vpn_uuid
         want = self.switch.get_active()
         ks_changed = want != self.baseline
-        if not vpn_changed and not ks_changed:  # no changes
+        self.wd_want = self.switch_wd.get_active()
+        self.wd_changed = self.wd_want != self.wd_baseline
+        if not vpn_changed and not ks_changed and not self.wd_changed:  # no changes
             self.destroy()
             return
         self.set_controls_sensitive(False)
@@ -866,10 +896,12 @@ class SettingsWindow(Gtk.Window):
 
     # Step 4: the kill switch toggle. If it fails, the VPN change from steps 1-3 stays applied
     # (the profile is saved, the server list is updated); only the error is shown and the window
-    # stays open. A retry then sees no VPN change.
+    # stays open. A retry then sees no VPN change. The watchdog step (5) is not attempted after
+    # a failed kill switch step: only the kill switch error is shown, and a retry repeats the
+    # kill switch step and then runs the watchdog step.
     def step_killswitch(self, want, ks_changed):
         if not ks_changed:
-            self.finish_ok()
+            self.step_watchdog()
             return
         action = "enable" if want else "disable"  # with --now: immediately and on subsequent boots
         self.proc = run_async(
@@ -881,6 +913,38 @@ class SettingsWindow(Gtk.Window):
         self.proc = None
         self.finish(want, ok, stderr)
 
+    # Step 5: the watchdog toggle (a user unit, no sudo). If it fails, the earlier steps (the VPN
+    # profile, the kill switch) stay applied; only the error is shown and the window stays open.
+    # A retry then repeats only this step.
+    def step_watchdog(self):
+        if not self.wd_changed:
+            self.finish_ok()
+            return
+        action = "enable" if self.wd_want else "disable"  # with --now: immediately and at the next login
+        self.proc = run_async(
+            ["systemctl", "--user", action, "--now", WATCHDOG_UNIT],
+            self.on_watchdog_done,
+        )
+
+    def on_watchdog_done(self, ok, stderr):
+        self.proc = None
+        if ok:
+            self.wd_baseline = self.wd_want
+            self.finish_ok()
+            return
+        # Re-read the real state so that a retry compares against it.
+        self.wd_baseline = bool(unit_active(["systemctl", "--user"], WATCHDOG_UNIT))
+        self.busy = False
+        if self.closed:
+            return
+        self.set_controls_sensitive(True)
+        stderr = (stderr or "").strip()
+        verb = "enable" if self.wd_want else "disable"
+        msg = "Failed to %s the watchdog: %s" % (verb, stderr[:300] or "the unit did not change state")
+        if "not found" in stderr or "No such file" in stderr or "does not exist" in stderr:
+            msg += " Install it with watchdog/install-watchdog.sh."  # the unit file is not installed
+        self.show_error(msg)
+
     def finish_ok(self):
         self.tray.refresh_killswitch()
         self.busy = False
@@ -888,16 +952,17 @@ class SettingsWindow(Gtk.Window):
             self.destroy()
 
     def finish(self, want, ok, stderr):
-        """The systemctl command finished (or failed to start): refresh the status and show the result."""
+        """The kill switch systemctl command finished (or failed to start): refresh the status,
+        then continue with the watchdog step or show the error."""
         # busy is still True: sync() inside refresh_killswitch does not touch the switch,
         # so the user's choice stays in place until the result is shown.
         self.tray.refresh_killswitch()  # updates the menu line and tray.ks_active
-        self.busy = False
-        if self.closed:
-            return
         self.baseline = bool(self.tray.ks_active)
         if ok and self.tray.ks_active == want:
-            self.destroy()
+            self.step_watchdog()  # busy stays True until the whole sequence is over
+            return
+        self.busy = False
+        if self.closed:
             return
         self.set_controls_sensitive(True)
         stderr = (stderr or "").strip()

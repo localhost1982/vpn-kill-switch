@@ -588,13 +588,18 @@ While the icon is running as a unit, a second instance started manually exits im
 
 The `Settings…` menu item opens a separate "VPN kill-switch Settings" window in the center of
 the screen (a second window is not created: choosing the item again brings the open one
-to the front). Closing the window does not stop the icon. It contains two rows:
+to the front). Closing the window does not stop the icon. It contains three rows:
 
 - **VPN connection**: a dropdown with all VPN and WireGuard profiles of NetworkManager, sorted by
   name. This is the profile that the tray, the watchdog, the statistics and the kill switch follow.
   If NetworkManager has no such profiles, the dropdown is disabled and shows
   `No VPN profiles in NetworkManager`;
-- **Kill switch**: a toggle that enables or disables `vpn-killswitch.service`.
+- **Kill switch**: a toggle that enables or disables `vpn-killswitch.service`;
+- **Watchdog** (`Reconnect the selected VPN profile automatically when it drops.`): a toggle that
+  enables or disables the user unit `vpn-watchdog.service` (see "Watchdog"). It runs
+  `systemctl --user enable --now vpn-watchdog.service` or `systemctl --user disable --now
+  vpn-watchdog.service`, without `sudo`. The unit is enabled or disabled, not only started or stopped,
+  so the choice persists across logins.
 
 The choice is stored in `~/.config/vpn-killswitch/settings.conf` (`$XDG_CONFIG_HOME` is respected):
 
@@ -627,6 +632,8 @@ unavailable:
    does not wait for the VPN to come up).
 4. If the kill switch toggle was changed: `sudo -n systemctl enable --now vpn-killswitch.service` (to
    enable) or `sudo -n systemctl disable --now vpn-killswitch.service` (to disable).
+5. If the watchdog toggle was changed: `systemctl --user enable --now vpn-watchdog.service` (to
+   enable) or `systemctl --user disable --now vpn-watchdog.service` (to disable). No `sudo`.
 
 After a successful save the window closes.
 
@@ -643,12 +650,21 @@ become available again, and after fixing the problem you can press `Save` again:
   updated and the new VPN is being connected); only the error is shown, for example
   `Failed to enable the kill switch: ...` or, without the rules, the hint
   `No passwordless permission to manage the kill switch.` with the two sudoers lines. The toggle stays
-  in the selected position. A retry no longer sees a VPN change and repeats only this step.
+  in the selected position. A retry no longer sees a VPN change and repeats only this step. The
+  watchdog step is not attempted after a failed kill switch step: only the kill switch error is
+  shown, and a retry repeats the kill switch step and then runs the watchdog step.
+- Step 5 fails: the earlier steps (VPN profile, kill switch) stay applied; the window stays open with
+  `Failed to enable the watchdog: ...` or `Failed to disable the watchdog: ...` (systemd's error
+  text, or `the unit did not change state` if there is none). If the unit file is not installed
+  (the message says `not found`, `No such file` or `does not exist`), the hint
+  ` Install it with watchdog/install-watchdog.sh.` is appended. A retry repeats only this step.
 
-The initial position of the toggle is taken from `systemctl is-active`; as long as the user has not
+The initial position of the kill switch toggle is taken from `systemctl is-active`; as long as the user has not
 touched it, it is updated together with the `Kill switch: …` line in the menu. The state persists
 across reboots: a disabled kill switch will not turn itself back on until it is enabled again (in
-this window or with `sudo systemctl enable --now vpn-killswitch.service`).
+this window or with `sudo systemctl enable --now vpn-killswitch.service`). The watchdog toggle is read
+once, when the window opens, from `systemctl --user is-active vpn-watchdog.service` (any state other
+than `active` counts as off); it is not updated while the window is open.
 
 Under Wayland an application cannot position its own window, so the unit starts
 the tray with `GDK_BACKEND=x11` (through XWayland): this does not affect the icon, and the window
@@ -660,7 +676,9 @@ them `Save` will not work: the window will stay open and show a hint with the mi
 
 ## Watchdog
 
-The watchdog keeps the VPN profile selected in Settings connected. Every 3 seconds it reads the
+The watchdog keeps the VPN profile selected in Settings connected. It can be switched on and off
+with the `Watchdog` toggle in the Settings window (see "Settings"; the unit must be installed first
+with `install-watchdog.sh`). Every 3 seconds it reads the
 profile UUID from `~/.config/vpn-killswitch/settings.conf` (`$XDG_CONFIG_HOME` is respected) and, if
 that profile is not among the active NetworkManager connections, runs
 `nmcli connection up uuid <UUID>` (and writes `watchdog: bringing up <UUID>` to the journal). The file
