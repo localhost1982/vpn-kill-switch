@@ -22,9 +22,9 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 VPN_NAME = "VPN-L2TP"
 KILLSWITCH_UNIT = "vpn-killswitch.service"
 
-ICON_ACTIVE = "network-vpn-symbolic"
-ICON_ACTIVATING = "network-vpn-acquiring-symbolic"
-ICON_OFF = "network-vpn-disconnected-symbolic"
+ICON_ACTIVE = "org.gnome.Settings-network-symbolic"  # значок «Сеть» из Настроек GNOME
+ICON_ACTIVATING = "network-wired-acquiring-symbolic"
+ICON_OFF = "network-wired-disconnected-symbolic"
 
 # Шаблоны строк pppd. `journalctl -o cat` печатает только текст сообщения,
 # без префикса «pppd[PID]:», процесс отбирается через _COMM=pppd.

@@ -280,9 +280,9 @@ sudo systemctl reload vpn-killswitch.service
 
 | Значок | Когда |
 |---|---|
-| `network-vpn-symbolic` | VPN-L2TP подключён |
-| `network-vpn-acquiring-symbolic` | VPN-L2TP подключается |
-| `network-vpn-disconnected-symbolic` | VPN-L2TP не подключён |
+| `org.gnome.Settings-network-symbolic` | VPN-L2TP подключён (значок «Сеть» из Настроек GNOME) |
+| `network-wired-acquiring-symbolic` | VPN-L2TP подключается |
+| `network-wired-disconnected-symbolic` | VPN-L2TP не подключён |
 
 **Меню** (первые четыре строки только показывают данные и обновляются при открытии
 меню и по таймерам):
