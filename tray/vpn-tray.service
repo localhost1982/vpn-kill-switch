@@ -1,0 +1,13 @@
+[Unit]
+Description=VPN-L2TP tray indicator
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 @TRAY_DIR@/vpn-tray.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
