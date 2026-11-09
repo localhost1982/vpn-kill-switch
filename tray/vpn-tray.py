@@ -14,10 +14,11 @@ import time
 
 import gi
 
+gi.require_version("Gdk", "3.0")
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("NM", "1.0")
-from gi.repository import Gio, GLib, Gtk, NM  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, NM  # noqa: E402
 from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 
 VPN_NAME = "VPN-L2TP"
@@ -318,12 +319,12 @@ class Tray:
 
 
 class SettingsWindow(Gtk.Window):
-    """Окно настроек: пока один переключатель kill switch."""
+    """Окно настроек: пока один переключатель kill switch. Применяется по кнопке «Сохранить»."""
 
     def __init__(self, tray):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.tray = tray
-        self.updating = False   # True, пока переключатель выставляем из кода, а не кликом
+        self.baseline = False   # положение kill switch в системе на момент открытия/последнего опроса
         self.busy = False       # команда systemctl ещё выполняется
         self.closed = False
         self.proc = None        # ссылка на Gio.Subprocess, пока он работает
@@ -335,6 +336,7 @@ class SettingsWindow(Gtk.Window):
         self.set_icon_name(ICON_ACTIVE)
         self.set_border_width(18)
         self.connect("destroy", self.on_destroy)
+        self.connect("key-press-event", self.on_key_press)
 
         title = Gtk.Label(halign=Gtk.Align.START, hexpand=True)
         title.set_markup("<b>Kill switch</b>")
@@ -372,35 +374,52 @@ class SettingsWindow(Gtk.Window):
         self.error_label.set_no_show_all(True)
         self.error_label.hide()
 
+        self.btn_cancel = Gtk.Button(label="Отмена")
+        self.btn_cancel.connect("clicked", self.on_cancel)
+        self.btn_save = Gtk.Button(label="Сохранить")
+        self.btn_save.get_style_context().add_class("suggested-action")
+        self.btn_save.set_can_default(True)
+        self.btn_save.connect("clicked", self.on_save)
+
+        buttons = Gtk.ButtonBox(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        buttons.set_layout(Gtk.ButtonBoxStyle.END)
+        buttons.add(self.btn_cancel)
+        buttons.add(self.btn_save)
+
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.pack_start(listbox, False, False, 0)
         box.pack_start(self.error_label, False, False, 0)
+        box.pack_start(buttons, False, False, 0)
         self.add(box)
+        self.set_default(self.btn_save)  # Enter = «Сохранить»
 
         # Начальное состояние берём из актуального статуса юнита, без запуска команд.
         self.tray.refresh_killswitch()
-        self.set_switch(bool(self.tray.ks_active))
-        self.switch.connect("state-set", self.on_state_set)
+        self.baseline = bool(self.tray.ks_active)
+        self.switch.set_active(self.baseline)
 
         self.show_all()
 
     def on_destroy(self, *_):
         self.closed = True
 
-    def set_switch(self, value):
-        """Выставить переключатель из кода: обработчик state-set команд не запускает."""
-        self.updating = True
-        try:
-            self.switch.set_active(value)
-            self.switch.set_state(value)
-        finally:
-            self.updating = False
+    def on_key_press(self, widget, event):
+        if event.keyval == Gdk.KEY_Escape:  # Escape = «Отмена»
+            self.on_cancel()
+            return True
+        return False
+
+    def on_cancel(self, *_):
+        self.destroy()
 
     def sync(self):
         """Вызывается из Tray.refresh_killswitch: подтянуть положение переключателя."""
         if self.closed or self.busy:
             return
-        self.set_switch(bool(self.tray.ks_active))
+        cur = bool(self.tray.ks_active)
+        if self.switch.get_active() == self.baseline:  # пользователь переключатель не трогал
+            self.switch.set_active(cur)
+        self.baseline = cur
 
     def show_error(self, text):
         self.error_label.set_text(text)
@@ -409,14 +428,20 @@ class SettingsWindow(Gtk.Window):
     def clear_error(self):
         self.error_label.hide()
 
-    def on_state_set(self, switch, state):
-        if self.updating:
-            return False
-        if self.busy:
-            return True
-        want = bool(state)
+    def set_controls_sensitive(self, value):
+        self.switch.set_sensitive(value)
+        self.btn_cancel.set_sensitive(value)
+        self.btn_save.set_sensitive(value)
+
+    def on_save(self, *_):
+        if self.busy or self.closed:
+            return
+        want = self.switch.get_active()
+        if want == self.baseline:  # изменений нет
+            self.destroy()
+            return
         action = "enable" if want else "disable"  # с --now: сразу и на следующие загрузки
-        switch.set_sensitive(False)
+        self.set_controls_sensitive(False)
         self.busy = True
         self.clear_error()
         try:
@@ -429,7 +454,6 @@ class SettingsWindow(Gtk.Window):
             log("sudo systemctl %s: %s" % (action, e))
             self.proc = None
             self.finish(want, False, str(e))
-        return True  # состояние переключателя выставляем сами, после команды
 
     def on_command_done(self, proc, res, want):
         stderr = ""
@@ -445,15 +469,17 @@ class SettingsWindow(Gtk.Window):
 
     def finish(self, want, ok, stderr):
         """Команда закончилась (или не запустилась): обновить статус и показать итог."""
-        self.busy = False
+        # busy ещё True: sync() внутри refresh_killswitch переключатель не трогает,
+        # выбор пользователя остаётся на месте до вывода результата.
         self.tray.refresh_killswitch()  # обновит строку меню и tray.ks_active
+        self.busy = False
         if self.closed:
             return
-        self.switch.set_sensitive(True)
-        self.set_switch(bool(self.tray.ks_active))
+        self.baseline = bool(self.tray.ks_active)
         if ok and self.tray.ks_active == want:
-            self.clear_error()
+            self.destroy()
             return
+        self.set_controls_sensitive(True)
         stderr = (stderr or "").strip()
         if "password" in stderr.lower():
             user = getpass.getuser()
@@ -465,6 +491,8 @@ class SettingsWindow(Gtk.Window):
             )
         else:
             verb = "включить" if want else "выключить"
+            if not stderr:
+                stderr = "юнит не перешёл в нужное состояние"
             self.show_error("Не удалось %s kill switch: %s" % (verb, stderr[:300]))
 
 
