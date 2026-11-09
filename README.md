@@ -474,11 +474,11 @@ is the profile selected in the Settings window.
 **Menu** (the lines only display data and are refreshed when the menu is opened and by timers;
 clicking the `Kill switch: …` line opens the "Dropped packets" window, see below):
 
-- `My VPN: connected 4h 12m` or `My VPN: disconnected` (`My VPN` stands for the name of the selected
-  profile; while connecting: `My VPN: connecting…`). The time is counted
+- `VPN: connected 4h 12m (My VPN)` or `VPN: disconnected (My VPN)` (`My VPN` stands for the name of the selected
+  profile; while connecting: `VPN: connecting… (My VPN)`). The time is counted
   from the last successful activation of the profile. If no profile is selected, the line reads
   `VPN: not selected`; if the selected profile was deleted from NetworkManager, `VPN: profile not found`;
-  `My VPN: state unknown` means that NetworkManager does not answer;
+  `VPN: state unknown (My VPN)` means that NetworkManager does not answer;
 - `Uptime: 5h 01m`. System uptime;
 - `Kill switch: active, 0 packets dropped`, `Kill switch: OFF` or
   `Kill switch: active, journal unavailable`. The number is the count of packets logged in the kernel
@@ -490,7 +490,7 @@ clicking the `Kill switch: …` line opens the "Dropped packets" window, see bel
   the total is the larger of the number of `Connection terminated` and the sum of the causes, and the
   number in parentheses is the count of `No response to N echo-requests`. These are pppd
   messages, so for VPN types without pppd the line stays at 0;
-- `Reconnect VPN` runs `nmcli connection up uuid <UUID of the selected profile>` in the background
+- `Reconnect VPN` brings the selected profile down (if it is active) and up again with `nmcli`, in the background
   (it is unavailable while no profile is selected);
 - `Settings…` opens the settings window (see "Settings" below);
 - `Quit` closes the icon (the unit is not restarted in that case, see below).

@@ -465,8 +465,16 @@ class Tray:
         self.refresh_killswitch()
 
     def on_reconnect(self, *_):
-        if self.vpn_uuid:
-            self.start_vpn(self.vpn_uuid)
+        """Reconnect: `nmcli connection up` on an active profile only reports "already active",
+        so an active connection is brought down first and then up again."""
+        uuid = self.vpn_uuid
+        if not uuid:
+            return
+        if self.find_active_uuid(uuid) is not None:
+            run_async(["nmcli", "connection", "down", "uuid", uuid],
+                      lambda ok, stderr: self.start_vpn(uuid))
+        else:
+            self.start_vpn(uuid)
 
     def start_vpn(self, uuid):
         """Start `nmcli connection up` in the background (not awaited)."""
@@ -579,7 +587,7 @@ class Tray:
             return
         name = self.vpn_name()
         if self.client is None:
-            self.set_state(ICON_OFF, "%s: state unknown" % (name or "VPN"), "VPN: no data")
+            self.set_state(ICON_OFF, "VPN: state unknown" + (" (%s)" % name if name else ""), "VPN: no data")
             return
         if name is None:  # the selected profile was deleted from NetworkManager
             self.watch_active(None)
@@ -591,19 +599,19 @@ class Tray:
             state = ac.get_state() if ac is not None else None
         except Exception as e:
             log("VPN state: %s" % e)
-            self.set_state(ICON_OFF, "%s: state unknown" % name, "VPN: no data")
+            self.set_state(ICON_OFF, "VPN: state unknown (%s)" % name, "VPN: no data")
             return
 
         if state == NM.ActiveConnectionState.ACTIVATED:
-            text = "%s: connected" % name
+            text = "VPN: connected"
             ts = self.activation_time()
             if ts is not None:
                 text += " " + fmt_duration(max(0, time.time() - ts))
-            self.set_state(ICON_ACTIVE, text, "VPN connected")
+            self.set_state(ICON_ACTIVE, "%s (%s)" % (text, name), "VPN connected")
         elif state == NM.ActiveConnectionState.ACTIVATING:
-            self.set_state(ICON_ACTIVATING, "%s: connecting…" % name, "VPN connecting")
+            self.set_state(ICON_ACTIVATING, "VPN: connecting… (%s)" % name, "VPN connecting")
         else:
-            self.set_state(ICON_OFF, "%s: disconnected" % name, "VPN disconnected")
+            self.set_state(ICON_OFF, "VPN: disconnected (%s)" % name, "VPN disconnected")
 
     def set_state(self, icon, label, title):
         if self.item_vpn.get_label() != label:
