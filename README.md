@@ -20,7 +20,7 @@ up to date.
 | `killswitch.nft` | Generic nftables rules. Installed to `/etc/nftables.d/killswitch.nft`. |
 | `vpn-killswitch.service` | systemd unit that loads the rules before the network comes up. Installed to `/etc/systemd/system/`. |
 | `vpn-killswitch-server.sh` | Root helper that resolves the VPN server host names and writes the allowed server addresses. Installed to `/usr/local/sbin/vpn-killswitch-server`. |
-| `install.sh` | Installation and enabling. `--server HOST` sets the VPN server on the first install. |
+| `install.sh` | Installation and enabling. Offers a menu of the NetworkManager VPN profiles (or `--vpn NAME`) and sets up the kill switch, the tray and the watchdog for the chosen one. |
 | `uninstall.sh` | Disabling and complete removal. |
 | `vpn-stats.sh` | Statistics of VPN drops and internet outages of the selected profile for the last N hours. |
 | `tray/vpn-tray.py` | VPN icon in the GNOME top bar with a statistics menu and the Settings window (VPN profile, kill switch). |
@@ -118,7 +118,7 @@ vpn-killswitch-server show                 show the saved hosts and the current 
 
 The server addresses are updated in two ways:
 
-- on the first install, `./install.sh --server <vpn-gateway-host>` calls `set`;
+- on install, `./install.sh` calls `set` with the server hosts of the VPN profile you pick (or with the hosts given by `--server`);
 - when you pick another VPN profile and press `Save` in the tray Settings window, the tray
   calls `set` with the server hosts of that profile (see "Settings").
 
@@ -147,27 +147,63 @@ the `inet killswitch` table is recreated, and all other tables stay as they were
 
 ### 1. The kill switch
 
-The first install needs the VPN gateway, that is, the host name or IPv4 address that the
-VPN profile connects to (the "Gateway" or "Remote" field of the profile, or the endpoint of a
-WireGuard peer). It has to stay reachable outside the tunnel:
-
-```bash
-./install.sh --server <vpn-gateway-host>
-```
-
-The option is repeatable (`--server HOST --server HOST`). The script re-runs itself through
-`sudo`, copies the rules, the unit and the helper, resolves the server and checks the rules
-syntax, enables the service and shows the loaded table. Without `--server` the first install
-stops with `No VPN server configured yet. Run: ./install.sh --server <vpn-gateway-host>`.
-
-To re-install (for example after editing `killswitch.nft`), run it without the option:
-
 ```bash
 ./install.sh
 ```
 
-The saved server list is kept. The VPN profile itself is chosen later in the tray Settings,
-and picking a profile there replaces the server list with the servers of that profile.
+The script re-runs itself through `sudo` and shows a menu of the VPN and WireGuard profiles
+that NetworkManager knows, sorted by name. Each line reads `NAME  (type, server host)`:
+
+```
+Select the VPN profile for the kill switch, the tray and the watchdog:
+  Office PPTP  (vpn, vpn.example.com)
+  Office VPN  (vpn, vpn.example.com)
+  VPN-L2TP  (vpn, vpn.example.com)
+```
+
+Move with `Up`/`Down` (or `k`/`j`) and press `Enter`; no typing is needed. The current line is
+highlighted. `Esc`, `q` or `Ctrl-C` abort the installation (exit code 130). If a profile was
+already saved in the settings file, it is preselected.
+
+For the chosen profile the script:
+
+1. finds the VPN server host(s) the same way the tray does (see "Settings"): for a VPN profile the
+   first non-empty of `gateway`, `remote`, `address`; for a WireGuard profile the peer endpoints
+   (read from NetworkManager over D-Bus, because `nmcli` does not show them). If no host can be
+   determined it stops with `Cannot determine the VPN server of profile NAME; run with --server HOST.`;
+2. copies the rules, the unit and the helper, resolves the server host(s), checks the rules syntax
+   (`vpn-killswitch-server set HOST...`), enables the service and shows the loaded table;
+3. saves the profile UUID for the tray, the watchdog and the stats script to
+   `~/.config/vpn-killswitch/settings.conf` of the user who ran `sudo` (the directory is created
+   with mode 0700, the file is owned by that user; see "Settings"). It prints
+   `Selected VPN profile: NAME (UUID)` and `Settings written to <path>`;
+4. restarts the tray (`systemctl --user try-restart vpn-tray.service` as that user) if it is
+   running, so that it picks up the new profile, and says whether it did. The watchdog reads
+   the file every few seconds and needs no restart.
+
+If the script is not started through `sudo` from a user account (for example from a root shell),
+the settings file is not written and a note says so; the kill switch itself is still installed.
+
+Options:
+
+- `--vpn NAME_OR_UUID`: choose the profile without the menu, by its exact name or UUID. Use it in
+  scripts and over a connection without a terminal;
+- `--server HOST`: the host name or IPv4 address that must stay reachable outside the tunnel
+  (repeatable: `--server HOST --server HOST`). It overrides the servers found in the profile. On its
+  own (without `--vpn`) it skips the menu and writes no profile: this is the old behaviour;
+- `--dry-run`: does not use `sudo` and changes nothing. It lists the profiles, shows the menu (or uses
+  `--vpn`), resolves the servers and prints every command it would run (`install`, the helper `set`,
+  the settings file, `systemctl`) with a `[dry-run]` prefix;
+- `-h`, `--help`: help (needs no `sudo`).
+
+Without a terminal and without `--vpn` or `--server` the script stops with
+`No terminal for the profile menu; run with --vpn NAME or --server HOST.` If NetworkManager has no
+VPN profile it stops with
+`No VPN profiles found in NetworkManager; create one first or run with --server HOST.`
+
+To re-install (for example after editing `killswitch.nft`), run `./install.sh` again and press
+`Enter` on the preselected profile, or run `./install.sh --vpn NAME`. The server list is replaced by
+the servers of the chosen profile.
 
 To find the current address of a host:
 
@@ -181,8 +217,8 @@ getent hosts <vpn-gateway-host>
 ./tray/install-tray.sh
 ```
 
-See "Tray icon" below for the requirements. Then open `Settings…` in the tray menu and
-choose the VPN connection.
+See "Tray icon" below for the requirements. The VPN profile picked in step 1 is already
+selected; open `Settings…` in the tray menu to change it.
 
 ### 3. The watchdog
 
@@ -608,8 +644,9 @@ The choice is stored in `~/.config/vpn-killswitch/settings.conf` (`$XDG_CONFIG_H
 uuid = 00000000-0000-0000-0000-000000000000
 ```
 
-The file holds the UUID of the profile, so renaming the profile does not matter. The tray is the
-only writer; the watchdog and `vpn-stats.sh` read the file. Until a profile is selected the file does
+The file holds the UUID of the profile, so renaming the profile does not matter. The tray and
+`install.sh` (which saves the profile you pick in its menu) write the file; the watchdog and
+`vpn-stats.sh` read it. Until a profile is selected the file does
 not exist, and the tray shows `VPN: not selected` with the `network-wired-disconnected-symbolic` icon
 and a disabled `Reconnect VPN`; the watchdog does nothing.
 
@@ -760,7 +797,7 @@ It re-resolves the saved hosts, checks and reloads the rules.
 **`Save` in Settings fails with a sudoers hint.** The tray runs `sudo -n` and cannot ask for a
 password. Add the lines from the hint (or all four from "Installation", "The sudoers rules") to
 `/etc/sudoers.d/vpn-stats` with `sudo visudo -f /etc/sudoers.d/vpn-stats` and press `Save` again.
-If the helper is missing (the kill switch is not installed), run `./install.sh --server <vpn-gateway-host>` first.
+If the helper is missing (the kill switch is not installed), run `./install.sh` first.
 
 **The tray shows `VPN: not selected` or `VPN: profile not found`.** The first means that no
 profile is chosen yet (no settings file): open `Settings…`, select the VPN connection and press
