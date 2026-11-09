@@ -4,6 +4,7 @@
 # Запуск: ./vpn-tray.py (обычно через пользовательский юнит vpn-tray.service).
 
 import fcntl
+import getpass
 import os
 import re
 import signal
@@ -16,7 +17,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("NM", "1.0")
-from gi.repository import GLib, Gtk, NM  # noqa: E402
+from gi.repository import Gio, GLib, Gtk, NM  # noqa: E402
 from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 
 VPN_NAME = "VPN-L2TP"
@@ -95,6 +96,8 @@ class Tray:
         self.last_icon = None
         self.last_title = None
 
+        self.ks_active = None   # True/False, None если `systemctl is-active` не выполнился
+        self.settings_win = None  # окно настроек, пока оно открыто
         self.ks_text = "Kill switch: проверяю…"
         self.drops_text = "Падений VPN с загрузки: проверяю…"
 
@@ -112,6 +115,8 @@ class Tray:
         self.item_drops = Gtk.MenuItem(label=self.drops_text)
         item_reconnect = Gtk.MenuItem(label="Переподключить VPN")
         item_reconnect.connect("activate", self.on_reconnect)
+        item_settings = Gtk.MenuItem(label="Настройки…")
+        item_settings.connect("activate", self.on_settings)
         item_quit = Gtk.MenuItem(label="Выход")
         item_quit.connect("activate", lambda *_: Gtk.main_quit())
 
@@ -120,6 +125,7 @@ class Tray:
             self.menu.append(item)
         self.menu.append(Gtk.SeparatorMenuItem())
         self.menu.append(item_reconnect)
+        self.menu.append(item_settings)
         self.menu.append(item_quit)
         self.menu.connect("show", self.on_menu_show)
         self.menu.show_all()
@@ -169,6 +175,17 @@ class Tray:
             self.procs.append(p)
         except Exception as e:
             log("nmcli: %s" % e)
+
+    def on_settings(self, *_):
+        if self.settings_win is not None:
+            self.settings_win.present()
+            return
+        win = SettingsWindow(self)
+        win.connect("destroy", self.on_settings_destroy)
+        self.settings_win = win
+
+    def on_settings_destroy(self, *_):
+        self.settings_win = None
 
     # --- VPN ----------------------------------------------------------------
 
@@ -256,10 +273,13 @@ class Tray:
     def refresh_killswitch(self):
         rc, out = run(["systemctl", "is-active", KILLSWITCH_UNIT])
         if rc is None:
+            self.ks_active = None
             text = "Kill switch: статус неизвестен"
         elif out.strip() != "active":
+            self.ks_active = False
             text = "Kill switch: ВЫКЛЮЧЕН"
         else:
+            self.ks_active = True
             pkts = self.read_drop_counter()
             if pkts is None:
                 text = "Kill switch: активен, нет доступа к счётчику"
@@ -267,6 +287,8 @@ class Tray:
                 text = "Kill switch: активен, отброшено %d %s" % (pkts, plural_packets(pkts))
         if self.item_ks.get_label() != text:
             self.item_ks.set_label(text)
+        if self.settings_win is not None:
+            self.settings_win.sync()
 
     def read_drop_counter(self):
         rc, out = run(["sudo", "-n", "nft", "list", "chain", "inet", "killswitch", "output"])
@@ -293,6 +315,157 @@ class Tray:
             text = "Падений VPN с загрузки: %d (сервер молчал: %d)" % (total, lcp)
         if self.item_drops.get_label() != text:
             self.item_drops.set_label(text)
+
+
+class SettingsWindow(Gtk.Window):
+    """Окно настроек: пока один переключатель kill switch."""
+
+    def __init__(self, tray):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.tray = tray
+        self.updating = False   # True, пока переключатель выставляем из кода, а не кликом
+        self.busy = False       # команда systemctl ещё выполняется
+        self.closed = False
+        self.proc = None        # ссылка на Gio.Subprocess, пока он работает
+
+        self.set_title("Настройки VPN-L2TP")
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_resizable(False)
+        self.set_default_size(440, -1)
+        self.set_icon_name(ICON_ACTIVE)
+        self.set_border_width(18)
+        self.connect("destroy", self.on_destroy)
+
+        title = Gtk.Label(halign=Gtk.Align.START, hexpand=True)
+        title.set_markup("<b>Kill switch</b>")
+        title.set_xalign(0)
+        subtitle = Gtk.Label(
+            label="Блокировать трафик в обход VPN. Положение сохраняется после перезагрузки.",
+            halign=Gtk.Align.START,
+            hexpand=True,
+        )
+        subtitle.get_style_context().add_class("dim-label")
+        subtitle.set_line_wrap(True)
+        subtitle.set_xalign(0)
+
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        texts.pack_start(title, False, False, 0)
+        texts.pack_start(subtitle, False, False, 0)
+
+        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER, hexpand=False)
+
+        row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        row_box.set_border_width(12)
+        row_box.pack_start(texts, True, True, 0)
+        row_box.pack_start(self.switch, False, False, 0)
+
+        row = Gtk.ListBoxRow()
+        row.add(row_box)
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        listbox.get_style_context().add_class("frame")
+        listbox.add(row)
+
+        self.error_label = Gtk.Label(halign=Gtk.Align.START)
+        self.error_label.set_line_wrap(True)
+        self.error_label.set_xalign(0)
+        self.error_label.set_selectable(True)
+        self.error_label.set_no_show_all(True)
+        self.error_label.hide()
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.pack_start(listbox, False, False, 0)
+        box.pack_start(self.error_label, False, False, 0)
+        self.add(box)
+
+        # Начальное состояние берём из актуального статуса юнита, без запуска команд.
+        self.tray.refresh_killswitch()
+        self.set_switch(bool(self.tray.ks_active))
+        self.switch.connect("state-set", self.on_state_set)
+
+        self.show_all()
+
+    def on_destroy(self, *_):
+        self.closed = True
+
+    def set_switch(self, value):
+        """Выставить переключатель из кода: обработчик state-set команд не запускает."""
+        self.updating = True
+        try:
+            self.switch.set_active(value)
+            self.switch.set_state(value)
+        finally:
+            self.updating = False
+
+    def sync(self):
+        """Вызывается из Tray.refresh_killswitch: подтянуть положение переключателя."""
+        if self.closed or self.busy:
+            return
+        self.set_switch(bool(self.tray.ks_active))
+
+    def show_error(self, text):
+        self.error_label.set_text(text)
+        self.error_label.show()
+
+    def clear_error(self):
+        self.error_label.hide()
+
+    def on_state_set(self, switch, state):
+        if self.updating:
+            return False
+        if self.busy:
+            return True
+        want = bool(state)
+        action = "enable" if want else "disable"  # с --now: сразу и на следующие загрузки
+        switch.set_sensitive(False)
+        self.busy = True
+        self.clear_error()
+        try:
+            self.proc = Gio.Subprocess.new(
+                ["sudo", "-n", "systemctl", action, "--now", KILLSWITCH_UNIT],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+            )
+            self.proc.communicate_utf8_async(None, None, self.on_command_done, want)
+        except Exception as e:
+            log("sudo systemctl %s: %s" % (action, e))
+            self.proc = None
+            self.finish(want, False, str(e))
+        return True  # состояние переключателя выставляем сами, после команды
+
+    def on_command_done(self, proc, res, want):
+        stderr = ""
+        ok = False
+        try:
+            _, _, stderr = proc.communicate_utf8_finish(res)
+            ok = proc.get_if_exited() and proc.get_exit_status() == 0
+        except Exception as e:
+            log("sudo systemctl: %s" % e)
+            stderr = str(e)
+        self.proc = None
+        self.finish(want, ok, stderr or "")
+
+    def finish(self, want, ok, stderr):
+        """Команда закончилась (или не запустилась): обновить статус и показать итог."""
+        self.busy = False
+        self.tray.refresh_killswitch()  # обновит строку меню и tray.ks_active
+        if self.closed:
+            return
+        self.switch.set_sensitive(True)
+        self.set_switch(bool(self.tray.ks_active))
+        if ok and self.tray.ks_active == want:
+            self.clear_error()
+            return
+        stderr = (stderr or "").strip()
+        if "password" in stderr.lower():
+            user = getpass.getuser()
+            self.show_error(
+                "Нет прав на управление kill switch без пароля. "
+                "Добавьте в /etc/sudoers.d/vpn-stats строки:\n"
+                "%s ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now %s\n"
+                "%s ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now %s" % (user, KILLSWITCH_UNIT, user, KILLSWITCH_UNIT)
+            )
+        else:
+            verb = "включить" if want else "выключить"
+            self.show_error("Не удалось %s kill switch: %s" % (verb, stderr[:300]))
 
 
 def acquire_lock():

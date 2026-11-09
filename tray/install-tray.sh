@@ -27,7 +27,7 @@ from gi.repository import Gtk, NM, AyatanaAppIndicator3
     exit 1
 fi
 
-# 2. Доступ к счётчику kill switch без пароля.
+# 2. Доступ без пароля: счётчик kill switch и управление юнитом из окна настроек.
 if ! sudo -n nft list chain inet killswitch output >/dev/null 2>&1; then
     echo "Предупреждение: sudo -n nft list chain inet killswitch output не проходит." >&2
     echo "Иконка будет работать, но вместо счётчика покажет «нет доступа к счётчику»." >&2
@@ -35,6 +35,16 @@ if ! sudo -n nft list chain inet killswitch output >/dev/null 2>&1; then
     echo "и добавьте строку:" >&2
     echo "  $USER ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch output" >&2
     echo "(если kill switch ещё не установлен, сначала выполните ./install.sh)" >&2
+fi
+
+# Переключатель в окне «Настройки…» запускает systemctl enable/disable --now через sudo -n.
+if ! sudo -n -l /usr/bin/systemctl enable --now vpn-killswitch.service >/dev/null 2>&1 \
+    || ! sudo -n -l /usr/bin/systemctl disable --now vpn-killswitch.service >/dev/null 2>&1; then
+    echo "Предупреждение: переключатель kill switch в окне «Настройки…» не сможет включать и выключать юнит." >&2
+    echo "Чтобы он заработал, выполните: sudo visudo -f /etc/sudoers.d/vpn-stats" >&2
+    echo "и добавьте две строки:" >&2
+    echo "  $USER ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now vpn-killswitch.service" >&2
+    echo "  $USER ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now vpn-killswitch.service" >&2
 fi
 
 # 3. Юнит с подставленным путём к скрипту.

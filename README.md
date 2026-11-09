@@ -296,6 +296,7 @@ sudo systemctl reload vpn-killswitch.service
   всего берётся большее из числа `Connection terminated` и суммы причин, в скобках
   число `No response to N echo-requests`;
 - `Переподключить VPN` запускает `nmcli connection up VPN-L2TP` в фоне;
+- `Настройки…` открывает окно настроек (см. «Окно настроек» ниже);
 - `Выход` закрывает иконку (юнит при этом не перезапускается, см. ниже).
 
 Длительности записаны так же, как в `vpn-stats.sh`: `12 с`, `3 мин 05 с`, `1 ч 02 мин`,
@@ -372,6 +373,41 @@ youruser ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch forward
 
 Сейчас иконка эту цепочку не читает, строка нужна только для будущего
 использования или для ручных запросов.
+
+### Окно настроек
+
+Пункт меню `Настройки…` открывает отдельное окно «Настройки VPN-L2TP» по центру
+экрана (второе окно не создаётся: повторный выбор пункта выводит открытое на
+передний план). Закрытие окна иконку не останавливает. Пока в нём один
+переключатель, **Kill switch**.
+
+Переключатель выполняет `sudo -n systemctl enable --now vpn-killswitch.service`
+(включить) или `sudo -n systemctl disable --now vpn-killswitch.service` (выключить),
+не блокируя меню: пока команда идёт, он недоступен. Положение переключателя
+берётся из `systemctl is-active` и обновляется вместе со строкой `Kill switch: …`
+в меню. Положение сохраняется после перезагрузки: выключенный kill switch сам
+не включится, пока его не включат снова (переключателем или `sudo systemctl
+enable --now vpn-killswitch.service`).
+
+Под Wayland приложение не может само расположить окно, поэтому юнит запускает
+трей с `GDK_BACKEND=x11` (через XWayland): иконке это не мешает, а окно
+открывается по центру.
+
+Без пароля `sudo -n` работает только при наличии правил в sudoers. Добавьте две
+строки в тот же файл, что и для счётчика:
+
+```bash
+sudo visudo -f /etc/sudoers.d/vpn-stats
+```
+
+```
+youruser ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now vpn-killswitch.service
+youruser ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now vpn-killswitch.service
+```
+
+Без них переключатель вернётся в прежнее положение и покажет в окне подсказку
+с этими строками. `install-tray.sh` проверяет это и при нехватке прав печатает
+предупреждение.
 
 ## Диагностика
 
