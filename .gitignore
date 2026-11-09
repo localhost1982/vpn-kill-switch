@@ -1,15 +1,15 @@
-# Редакторы и IDE
+# Editors and IDEs
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# Резервные копии и временные файлы
+# Backup and temporary files
 *.bak
 *.orig
 *.tmp
 
-# ОС
+# OS
 .DS_Store
 Thumbs.db

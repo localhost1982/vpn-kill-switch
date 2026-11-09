@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# Иконка VPN-L2TP в верхней панели GNOME: состояние VPN, аптайм, счётчик kill switch,
-# число падений VPN. Протокол AppIndicator (StatusNotifierItem).
-# Запуск: ./vpn-tray.py (обычно через пользовательский юнит vpn-tray.service).
+# VPN-L2TP icon in the GNOME top bar: VPN state, uptime, kill switch counter,
+# number of VPN drops. Uses the AppIndicator protocol (StatusNotifierItem).
+# Run: ./vpn-tray.py (normally via the user unit vpn-tray.service).
 
 import fcntl
 import getpass
@@ -24,19 +24,19 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 VPN_NAME = "VPN-L2TP"
 KILLSWITCH_UNIT = "vpn-killswitch.service"
 
-ICON_ACTIVE = "org.gnome.Settings-network-symbolic"  # значок «Сеть» из Настроек GNOME
+ICON_ACTIVE = "org.gnome.Settings-network-symbolic"  # the "Network" icon from GNOME Settings
 ICON_ACTIVATING = "network-wired-acquiring-symbolic"
 ICON_OFF = "network-wired-disconnected-symbolic"
 
-# Шаблоны строк pppd. `journalctl -o cat` печатает только текст сообщения,
-# без префикса «pppd[PID]:», процесс отбирается через _COMM=pppd.
+# pppd line patterns. `journalctl -o cat` prints only the message text,
+# without the "pppd[PID]:" prefix; the process is selected via _COMM=pppd.
 RE_LCP = re.compile(r"^No response to [0-9]+ echo-requests", re.M)
 RE_TERM = re.compile(r"^Terminating on signal", re.M)
 RE_CONN = re.compile(r"^Connection terminated\.", re.M)
 
-FAST_SECONDS = 5        # состояние VPN, аптайм (запасной опрос)
-KILLSWITCH_SECONDS = 60  # kill switch и счётчик пакетов (каждый опрос через sudo пишет в журнал)
-JOURNAL_SECONDS = 60    # падения VPN по журналу
+FAST_SECONDS = 5        # VPN state, uptime (fallback polling)
+KILLSWITCH_SECONDS = 60  # kill switch and packet counter (each sudo poll writes to the journal)
+JOURNAL_SECONDS = 60    # VPN drops from the journal
 
 
 def log(msg):
@@ -44,30 +44,24 @@ def log(msg):
 
 
 def fmt_duration(s):
-    """Секунды -> «12 с» / «3 мин 05 с» / «1 ч 02 мин» / «1 д 03 ч»."""
+    """Seconds -> "12s" / "3m 05s" / "1h 02m" / "1d 03h"."""
     s = int(s)
     if s < 60:
-        return "%d с" % s
+        return "%ds" % s
     if s < 3600:
-        return "%d мин %02d с" % (s // 60, s % 60)
+        return "%dm %02ds" % (s // 60, s % 60)
     if s < 86400:
-        return "%d ч %02d мин" % (s // 3600, (s % 3600) // 60)
-    return "%d д %02d ч" % (s // 86400, (s % 86400) // 3600)
+        return "%dh %02dm" % (s // 3600, (s % 3600) // 60)
+    return "%dd %02dh" % (s // 86400, (s % 86400) // 3600)
 
 
 def plural_packets(n):
-    """1 пакет, 2-4 пакета, 5+ пакетов."""
-    if n % 100 in (11, 12, 13, 14):
-        return "пакетов"
-    if n % 10 == 1:
-        return "пакет"
-    if n % 10 in (2, 3, 4):
-        return "пакета"
-    return "пакетов"
+    """1 packet, 0 or 2+ packets."""
+    return "packet" if n == 1 else "packets"
 
 
 def run(cmd, timeout=5):
-    """Запуск внешней команды. Возвращает (код, stdout) или (None, "") при ошибке."""
+    """Run an external command. Returns (code, stdout) or (None, "") on error."""
     try:
         r = subprocess.run(
             cmd,
@@ -78,7 +72,7 @@ def run(cmd, timeout=5):
             timeout=timeout,
         )
         return r.returncode, r.stdout
-    except Exception as e:  # таймаут, нет команды и т. п.
+    except Exception as e:  # timeout, command not found, etc.
         log("%s: %s" % (" ".join(cmd), e))
         return None, ""
 
@@ -89,18 +83,18 @@ class Tray:
         try:
             self.client = NM.Client.new(None)
         except Exception as e:
-            log("NetworkManager недоступен: %s" % e)
+            log("NetworkManager unavailable: %s" % e)
 
-        self.ac = None          # активное соединение VPN-L2TP (если есть)
+        self.ac = None          # active VPN-L2TP connection (if any)
         self.ac_handler = 0
-        self.procs = []         # фоновые nmcli, чтобы не плодить зомби
+        self.procs = []         # background nmcli processes, to avoid zombies
         self.last_icon = None
         self.last_title = None
 
-        self.ks_active = None   # True/False, None если `systemctl is-active` не выполнился
-        self.settings_win = None  # окно настроек, пока оно открыто
-        self.ks_text = "Kill switch: проверяю…"
-        self.drops_text = "Падений VPN с загрузки: проверяю…"
+        self.ks_active = None   # True/False, None if `systemctl is-active` failed to run
+        self.settings_win = None  # settings window while it is open
+        self.ks_text = "Kill switch: checking…"
+        self.drops_text = "VPN drops since boot: checking…"
 
         self.indicator = AppIndicator.Indicator.new(
             "vpn-l2tp-tray",
@@ -109,16 +103,16 @@ class Tray:
         )
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
 
-        # Информационные пункты остаются «чувствительными» (иначе серые) и ничего не делают.
+        # Informational items stay sensitive (otherwise they are greyed out) and do nothing.
         self.item_vpn = Gtk.MenuItem(label="VPN-L2TP: …")
-        self.item_uptime = Gtk.MenuItem(label="Ноутбук работает: …")
+        self.item_uptime = Gtk.MenuItem(label="Uptime: …")
         self.item_ks = Gtk.MenuItem(label=self.ks_text)
         self.item_drops = Gtk.MenuItem(label=self.drops_text)
-        item_reconnect = Gtk.MenuItem(label="Переподключить VPN")
+        item_reconnect = Gtk.MenuItem(label="Reconnect VPN")
         item_reconnect.connect("activate", self.on_reconnect)
-        item_settings = Gtk.MenuItem(label="Настройки…")
+        item_settings = Gtk.MenuItem(label="Settings…")
         item_settings.connect("activate", self.on_settings)
-        item_quit = Gtk.MenuItem(label="Выход")
+        item_quit = Gtk.MenuItem(label="Quit")
         item_quit.connect("activate", lambda *_: Gtk.main_quit())
 
         self.menu = Gtk.Menu()
@@ -144,7 +138,7 @@ class Tray:
         GLib.timeout_add_seconds(KILLSWITCH_SECONDS, self.tick_killswitch)
         GLib.timeout_add_seconds(JOURNAL_SECONDS, self.tick_journal)
 
-    # --- таймеры и события меню ---------------------------------------------
+    # --- timers and menu events ---------------------------------------------
 
     def tick_fast(self):
         self.refresh_vpn()
@@ -199,7 +193,7 @@ class Tray:
         return None
 
     def watch_active(self, ac):
-        """Подписка на смену состояния найденного активного соединения."""
+        """Subscribe to state changes of the active connection that was found."""
         if ac is self.ac:
             return
         if self.ac is not None and self.ac_handler:
@@ -213,7 +207,7 @@ class Tray:
             self.ac_handler = ac.connect("notify::state", lambda *_: self.refresh_vpn())
 
     def activation_time(self):
-        """Эпоха последней успешной активации профиля или None."""
+        """Epoch of the last successful activation of the profile, or None."""
         try:
             conn = self.client.get_connection_by_id(VPN_NAME)
             ts = conn.get_setting_connection().get_timestamp()
@@ -224,27 +218,27 @@ class Tray:
 
     def refresh_vpn(self):
         if self.client is None:
-            self.set_state(ICON_OFF, "VPN-L2TP: состояние неизвестно", "VPN: нет данных")
+            self.set_state(ICON_OFF, "VPN-L2TP: state unknown", "VPN: no data")
             return
         try:
             ac = self.find_active()
             self.watch_active(ac)
             state = ac.get_state() if ac is not None else None
         except Exception as e:
-            log("состояние VPN: %s" % e)
-            self.set_state(ICON_OFF, "VPN-L2TP: состояние неизвестно", "VPN: нет данных")
+            log("VPN state: %s" % e)
+            self.set_state(ICON_OFF, "VPN-L2TP: state unknown", "VPN: no data")
             return
 
         if state == NM.ActiveConnectionState.ACTIVATED:
-            text = "VPN-L2TP: подключён"
+            text = "VPN-L2TP: connected"
             ts = self.activation_time()
             if ts is not None:
                 text += " " + fmt_duration(max(0, time.time() - ts))
-            self.set_state(ICON_ACTIVE, text, "VPN подключён")
+            self.set_state(ICON_ACTIVE, text, "VPN connected")
         elif state == NM.ActiveConnectionState.ACTIVATING:
-            self.set_state(ICON_ACTIVATING, "VPN-L2TP: подключается…", "VPN подключается")
+            self.set_state(ICON_ACTIVATING, "VPN-L2TP: connecting…", "VPN connecting")
         else:
-            self.set_state(ICON_OFF, "VPN-L2TP: не подключён", "VPN не подключён")
+            self.set_state(ICON_OFF, "VPN-L2TP: disconnected", "VPN disconnected")
 
     def set_state(self, icon, label, title):
         if self.item_vpn.get_label() != label:
@@ -256,16 +250,16 @@ class Tray:
             self.indicator.set_title(title)
             self.last_title = title
 
-    # --- аптайм -------------------------------------------------------------
+    # --- uptime -------------------------------------------------------------
 
     def refresh_uptime(self):
         try:
             with open("/proc/uptime") as f:
                 up = float(f.read().split()[0])
-            text = "Ноутбук работает: " + fmt_duration(up)
+            text = "Uptime: " + fmt_duration(up)
         except Exception as e:
             log("/proc/uptime: %s" % e)
-            text = "Ноутбук работает: нет данных"
+            text = "Uptime: no data"
         if self.item_uptime.get_label() != text:
             self.item_uptime.set_label(text)
 
@@ -275,17 +269,17 @@ class Tray:
         rc, out = run(["systemctl", "is-active", KILLSWITCH_UNIT])
         if rc is None:
             self.ks_active = None
-            text = "Kill switch: статус неизвестен"
+            text = "Kill switch: status unknown"
         elif out.strip() != "active":
             self.ks_active = False
-            text = "Kill switch: ВЫКЛЮЧЕН"
+            text = "Kill switch: OFF"
         else:
             self.ks_active = True
             pkts = self.read_drop_counter()
             if pkts is None:
-                text = "Kill switch: активен, нет доступа к счётчику"
+                text = "Kill switch: active, counter unavailable"
             else:
-                text = "Kill switch: активен, отброшено %d %s" % (pkts, plural_packets(pkts))
+                text = "Kill switch: active, %d %s dropped" % (pkts, plural_packets(pkts))
         if self.item_ks.get_label() != text:
             self.item_ks.set_label(text)
         if self.settings_win is not None:
@@ -302,34 +296,34 @@ class Tray:
                     return int(m.group(1))
         return None
 
-    # --- падения VPN --------------------------------------------------------
+    # --- VPN drops ----------------------------------------------------------
 
     def refresh_drops(self):
         rc, out = run(["journalctl", "-b", "-q", "-o", "cat", "_COMM=pppd"])
         if rc != 0:
-            text = "Падений VPN с загрузки: нет данных"
+            text = "VPN drops since boot: no data"
         else:
             lcp = len(RE_LCP.findall(out))
             sig = len(RE_TERM.findall(out))
             conn = len(RE_CONN.findall(out))
             total = max(conn, lcp + sig)
-            text = "Падений VPN с загрузки: %d (сервер молчал: %d)" % (total, lcp)
+            text = "VPN drops since boot: %d (server silent: %d)" % (total, lcp)
         if self.item_drops.get_label() != text:
             self.item_drops.set_label(text)
 
 
 class SettingsWindow(Gtk.Window):
-    """Окно настроек: пока один переключатель kill switch. Применяется по кнопке «Сохранить»."""
+    """Settings window: for now a single kill switch toggle. Applied by the "Save" button."""
 
     def __init__(self, tray):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.tray = tray
-        self.baseline = False   # положение kill switch в системе на момент открытия/последнего опроса
-        self.busy = False       # команда systemctl ещё выполняется
+        self.baseline = False   # kill switch state in the system at open time / last poll
+        self.busy = False       # the systemctl command is still running
         self.closed = False
-        self.proc = None        # ссылка на Gio.Subprocess, пока он работает
+        self.proc = None        # reference to the Gio.Subprocess while it runs
 
-        self.set_title("Настройки VPN-L2TP")
+        self.set_title("VPN-L2TP Settings")
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_resizable(False)
         self.set_default_size(440, -1)
@@ -342,7 +336,7 @@ class SettingsWindow(Gtk.Window):
         title.set_markup("<b>Kill switch</b>")
         title.set_xalign(0)
         subtitle = Gtk.Label(
-            label="Блокировать трафик в обход VPN. Положение сохраняется после перезагрузки.",
+            label="Block traffic outside the VPN. The setting persists across reboots.",
             halign=Gtk.Align.START,
             hexpand=True,
         )
@@ -374,9 +368,9 @@ class SettingsWindow(Gtk.Window):
         self.error_label.set_no_show_all(True)
         self.error_label.hide()
 
-        self.btn_cancel = Gtk.Button(label="Отмена")
+        self.btn_cancel = Gtk.Button(label="Cancel")
         self.btn_cancel.connect("clicked", self.on_cancel)
-        self.btn_save = Gtk.Button(label="Сохранить")
+        self.btn_save = Gtk.Button(label="Save")
         self.btn_save.get_style_context().add_class("suggested-action")
         self.btn_save.set_can_default(True)
         self.btn_save.connect("clicked", self.on_save)
@@ -391,9 +385,9 @@ class SettingsWindow(Gtk.Window):
         box.pack_start(self.error_label, False, False, 0)
         box.pack_start(buttons, False, False, 0)
         self.add(box)
-        self.set_default(self.btn_save)  # Enter = «Сохранить»
+        self.set_default(self.btn_save)  # Enter = "Save"
 
-        # Начальное состояние берём из актуального статуса юнита, без запуска команд.
+        # Take the initial state from the current unit status, without running commands.
         self.tray.refresh_killswitch()
         self.baseline = bool(self.tray.ks_active)
         self.switch.set_active(self.baseline)
@@ -404,7 +398,7 @@ class SettingsWindow(Gtk.Window):
         self.closed = True
 
     def on_key_press(self, widget, event):
-        if event.keyval == Gdk.KEY_Escape:  # Escape = «Отмена»
+        if event.keyval == Gdk.KEY_Escape:  # Escape = "Cancel"
             self.on_cancel()
             return True
         return False
@@ -413,11 +407,11 @@ class SettingsWindow(Gtk.Window):
         self.destroy()
 
     def sync(self):
-        """Вызывается из Tray.refresh_killswitch: подтянуть положение переключателя."""
+        """Called from Tray.refresh_killswitch: update the switch position."""
         if self.closed or self.busy:
             return
         cur = bool(self.tray.ks_active)
-        if self.switch.get_active() == self.baseline:  # пользователь переключатель не трогал
+        if self.switch.get_active() == self.baseline:  # the user has not touched the switch
             self.switch.set_active(cur)
         self.baseline = cur
 
@@ -437,10 +431,10 @@ class SettingsWindow(Gtk.Window):
         if self.busy or self.closed:
             return
         want = self.switch.get_active()
-        if want == self.baseline:  # изменений нет
+        if want == self.baseline:  # no changes
             self.destroy()
             return
-        action = "enable" if want else "disable"  # с --now: сразу и на следующие загрузки
+        action = "enable" if want else "disable"  # with --now: immediately and on subsequent boots
         self.set_controls_sensitive(False)
         self.busy = True
         self.clear_error()
@@ -468,10 +462,10 @@ class SettingsWindow(Gtk.Window):
         self.finish(want, ok, stderr or "")
 
     def finish(self, want, ok, stderr):
-        """Команда закончилась (или не запустилась): обновить статус и показать итог."""
-        # busy ещё True: sync() внутри refresh_killswitch переключатель не трогает,
-        # выбор пользователя остаётся на месте до вывода результата.
-        self.tray.refresh_killswitch()  # обновит строку меню и tray.ks_active
+        """The command finished (or failed to start): refresh the status and show the result."""
+        # busy is still True: sync() inside refresh_killswitch does not touch the switch,
+        # so the user's choice stays in place until the result is shown.
+        self.tray.refresh_killswitch()  # updates the menu line and tray.ks_active
         self.busy = False
         if self.closed:
             return
@@ -484,32 +478,32 @@ class SettingsWindow(Gtk.Window):
         if "password" in stderr.lower():
             user = getpass.getuser()
             self.show_error(
-                "Нет прав на управление kill switch без пароля. "
-                "Добавьте в /etc/sudoers.d/vpn-stats строки:\n"
+                "No passwordless permission to manage the kill switch. "
+                "Add these lines to /etc/sudoers.d/vpn-stats:\n"
                 "%s ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now %s\n"
                 "%s ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now %s" % (user, KILLSWITCH_UNIT, user, KILLSWITCH_UNIT)
             )
         else:
-            verb = "включить" if want else "выключить"
+            verb = "enable" if want else "disable"
             if not stderr:
-                stderr = "юнит не перешёл в нужное состояние"
-            self.show_error("Не удалось %s kill switch: %s" % (verb, stderr[:300]))
+                stderr = "the unit did not reach the requested state"
+            self.show_error("Failed to %s the kill switch: %s" % (verb, stderr[:300]))
 
 
 def acquire_lock():
-    """Второй экземпляр не запускаем: иначе в панели будет две иконки."""
+    """Do not start a second instance: otherwise the panel would show two icons."""
     runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
     f = open(os.path.join(runtime, "vpn-tray.lock"), "w")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        log("vpn-tray уже запущен, выхожу.")
+        log("vpn-tray is already running, exiting.")
         sys.exit(0)
     return f
 
 
 def main():
-    lock = acquire_lock()  # держим ссылку до конца работы
+    lock = acquire_lock()  # keep the reference until exit
     tray = Tray()
     for sig in (signal.SIGINT, signal.SIGTERM):
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: Gtk.main_quit() or GLib.SOURCE_REMOVE)

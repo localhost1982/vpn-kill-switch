@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Статистика обрывов VPN-L2TP и пропаданий интернета за последние N часов.
-# Источник данных: журнал systemd (journalctl). Вывод: таблицы в формате Markdown.
-# Запуск: ./vpn-stats.sh [часы] [--events]   (подробности: ./vpn-stats.sh --help)
+# VPN-L2TP drop and internet-loss statistics for the last N hours.
+# Data source: the systemd journal (journalctl). Output: Markdown tables.
+# Usage: ./vpn-stats.sh [hours] [--events]   (details: ./vpn-stats.sh --help)
 
 set -euo pipefail
 
-# Десятичная точка в выводе awk не должна зависеть от локали.
+# The decimal point in awk output must not depend on the locale.
 export LC_NUMERIC=C
 
 VPN_NAME="VPN-L2TP"
 DEFAULT_HOURS=1
 
-# --- Шаблоны строк журнала (часть после «unit[pid]: ») -----------------------
-# Один и тот же набор используется и в grep (подсчёт), и в awk (через ENVIRON).
+# --- Journal line patterns (the part after "unit[pid]: ") -------------------
+# The same set is used both in grep (counting) and in awk (via ENVIRON).
 export RE_START="vpn\\[[^]]*\"VPN-L2TP\"\\]: starting l2tp"
 export RE_UP="policy: set 'VPN-L2TP' \\(ppp[0-9]+\\) as default for IPv4"
 export RE_FAIL="vpn\\[[^]]*\"VPN-L2TP\"\\]: failed to connect"
@@ -30,99 +30,100 @@ export RE_HELLO="message=recv message_type=avpMsgTypeHello"
 
 usage() {
     cat <<'USAGE'
-Использование: vpn-stats.sh [часы] [--events] [-h|--help]
+Usage: vpn-stats.sh [hours] [--events] [-h|--help]
 
-Статистика обрывов VPN-L2TP и пропаданий интернета за последние N часов
-(таблицы в формате Markdown, источник данных: журнал systemd).
+VPN-L2TP drop and internet-loss statistics for the last N hours
+(Markdown tables, data source: the systemd journal).
 
-  часы       период в часах, по умолчанию 1. Допускаются десятичная точка и запятая
-             (1.5, 1,5). Шаг 0.5 ч: значение округляется математически до ближайших
-             полчаса (0.7 -> 0.5, 0.75 -> 1, 1.2 -> 1, 1.3 -> 1.5). Если после
-             округления получился 0 или значение не число, берётся 1 ч.
-  --events   после таблиц вывести хронологию событий (подключения, обрывы, сон,
-             перезапуски NetworkManager, загрузки, сбои подключения)
-  -h, --help показать эту справку
+  hours      period in hours, default 1. Both a decimal point and a decimal comma
+             are accepted (1.5, 1,5). Step is 0.5 h: the value is rounded
+             half up to the nearest half hour (0.7 -> 0.5, 0.75 -> 1, 1.2 -> 1,
+             1.3 -> 1.5). If the result after rounding is 0 or the value is not
+             a number, 1 h is used.
+  --events   after the tables, print a chronology of events (connections, drops,
+             suspends, NetworkManager restarts, boots, connection failures)
+  -h, --help show this help
 
-Примеры:
-  ./vpn-stats.sh            # последний час
-  ./vpn-stats.sh 0.5        # последние полчаса
-  ./vpn-stats.sh 1,5        # полтора часа
-  ./vpn-stats.sh 3 --events # три часа с хронологией
+Examples:
+  ./vpn-stats.sh            # the last hour
+  ./vpn-stats.sh 0.5        # the last half hour
+  ./vpn-stats.sh 1,5        # an hour and a half
+  ./vpn-stats.sh 3 --events # three hours with the chronology
 
-sudo не нужен, кроме строки со счётчиком заблокированных пакетов kill switch:
-без sudo без пароля в ней будет «n/a (нужен sudo)». Пароль скрипт не запрашивает.
+sudo is not needed, except for the row with the kill switch blocked-packet counter:
+without passwordless sudo it will show "n/a (sudo required)". The script never asks for a password.
 USAGE
 }
 
-# --- Разбор аргумента «часы» ---------------------------------------------------
-# Результат: глобальные HALFHOURS (число получасов, >= 1) и NOTE (пояснение или пусто).
+# --- Parsing the "hours" argument ----------------------------------------------
+# Result: globals HALFHOURS (number of half hours, >= 1) and NOTE (a note or empty).
 parse_hours() {
     local raw=$1 norm
     NOTE=""
     norm=${raw//,/.}
     if [[ ! $norm =~ ^([0-9]+\.?[0-9]*|\.[0-9]+)$ ]]; then
-        NOTE="Параметр «${raw}» не распознан, использую ${DEFAULT_HOURS} ч."
+        NOTE="Argument \"${raw}\" is not a number, using the default of ${DEFAULT_HOURS} h."
         HALFHOURS=$((DEFAULT_HOURS * 2))
         return
     fi
-    # Математическое округление до ближайших 0.5 ч: int(h*2 + 0.5).
+    # Round half up to the nearest 0.5 h: int(h*2 + 0.5).
     HALFHOURS=$(awk -v h="$norm" 'BEGIN { printf "%d", h * 2 + 0.5 }')
     if (( HALFHOURS == 0 )); then
-        NOTE="Значение ${raw} округляется до 0, использую ${DEFAULT_HOURS} ч."
+        NOTE="Value ${raw} is zero after rounding, using the default of ${DEFAULT_HOURS} h."
         HALFHOURS=$((DEFAULT_HOURS * 2))
     fi
 }
 
-# Подпись периода: 0.5 ч, 1 ч, 1.5 ч, 2 ч (без «.0»).
+# Period label: 0.5 h, 1 h, 1.5 h, 2 h (without ".0").
 period_label() {
     local hh=$1
     if (( hh % 2 == 0 )); then
-        printf '%d ч' $((hh / 2))
+        printf '%d h' $((hh / 2))
     else
-        printf '%d.5 ч' $((hh / 2))
+        printf '%d.5 h' $((hh / 2))
     fi
 }
 
-# Количество строк журнала, подходящих под регулярное выражение (всегда одно число).
+# Number of journal lines matching a regular expression (always a single number).
 count() {
     grep -cE -- "$1" "$JOURNAL" || true
 }
 
-# Секунды -> «12 с» / «3 мин 05 с» / «1 ч 02 мин».
+# Seconds -> "12s" / "3m 05s" / "1h 02m".
 fmt_duration() {
     local s=$1
     if (( s < 60 )); then
-        printf '%d с' "$s"
+        printf '%ds' "$s"
     elif (( s < 3600 )); then
-        printf '%d мин %02d с' $((s / 60)) $((s % 60))
+        printf '%dm %02ds' $((s / 60)) $((s % 60))
     else
-        printf '%d ч %02d мин' $((s / 3600)) $(((s % 3600) / 60))
+        printf '%dh %02dm' $((s / 3600)) $(((s % 3600) / 60))
     fi
 }
 
-# Эпоха -> локальное время.
+# Epoch -> local time.
 fmt_time() { date -d "@$1" +%H:%M:%S; }
 fmt_datetime() { date -d "@$1" '+%Y-%m-%d %H:%M'; }
 
-# Подключён ли VPN прямо сейчас (0 = да).
+# Whether the VPN is connected right now (0 = yes).
 vpn_active() {
     local names
     names=$(nmcli -t -f NAME connection show --active 2>/dev/null || true)
     grep -Fxq -- "$VPN_NAME" <<<"$names"
 }
 
-# Статус юнита systemd -> «активен» / «не активен» / «недоступен» (если нет ответа).
+# systemd unit state -> "active" / "inactive" / "unavailable" (if there is no answer).
 unit_state() {
     local out
     out=$("$@" 2>/dev/null || true)
     case $out in
-        active) echo "активен" ;;
-        "")     echo "недоступен" ;;
-        *)      echo "не активен" ;;
+        active) echo "active" ;;
+        "")     echo "unavailable" ;;
+        *)      echo "inactive" ;;
     esac
 }
 
-# Число заблокированных kill switch пакетов; без sudo без пароля -> «n/a (нужен sudo)».
+# Number of packets blocked by the kill switch; without passwordless sudo -> "n/a (sudo required)".
 killswitch_drops() {
     local out pkts=""
     if out=$(sudo -n nft list chain inet killswitch output 2>/dev/null); then
@@ -131,16 +132,16 @@ killswitch_drops() {
     if [[ -n $pkts ]]; then
         echo "$pkts"
     else
-        echo "n/a (нужен sudo)"
+        echo "n/a (sudo required)"
     fi
 }
 
-# --- awk: разбор журнала ------------------------------------------------------
-# На вход: журнал в формате short-unix. На выходе строки с табуляцией:
-#   E <эпоха> <описание>      событие для режима --events
-#   D <эпоха> <причина>       обрыв VPN (LCP / сон / команда / прочее)
-#   G <итого> <макс> <с> <по> простои: суммарно, самый долгий (секунды) и его границы
-# Параметры: -v now=<эпоха> -v active=<0|1>; шаблоны берутся из окружения (RE_*).
+# --- awk: journal parsing -----------------------------------------------------
+# Input: the journal in short-unix format. Output: tab-separated lines:
+#   E <epoch> <description>   event for the --events mode
+#   D <epoch> <reason>        VPN drop (LCP / sleep / command / other)
+#   G <total> <max> <from> <to>  outages: total, longest (seconds) and its bounds
+# Parameters: -v now=<epoch> -v active=<0|1>; patterns come from the environment (RE_*).
 read -r -d '' AWK_PROG <<'AWK' || true
 function add(t, kind, pid) { n++; T[n] = t; K[n] = kind; P[n] = pid }
 function pppd_pid(   s) {
@@ -160,7 +161,7 @@ BEGIN {
     re_wake = ENVIRON["RE_WAKE"];   re_nm = ENVIRON["RE_NM_STOP"]
     re_boot = ENVIRON["RE_BOOT"]
 }
-# Первый проход: собираем значимые события в хронологическом порядке.
+# First pass: collect significant events in chronological order.
 {
     t = $1 + 0
     if      ($0 ~ re_up)      add(t, "UP", "")
@@ -175,30 +176,30 @@ BEGIN {
     else if ($0 ~ re_boot)    add(t, "BOOT", "")
 }
 END {
-    # Моменты ухода в сон нужны, чтобы отличить «Terminating» из-за сна от ручного.
+    # Suspend moments are needed to tell a sleep-caused "Terminating" from a manual one.
     ns = 0
     for (i = 1; i <= n; i++) if (K[i] == "SLEEP") SL[++ns] = T[i]
 
-    # Классификация обрывов. «Connection terminated» после «No response» или
-    # «Terminating» того же pppd - продолжение того же обрыва (isdup).
+    # Drop classification. "Connection terminated" after "No response" or
+    # "Terminating" of the same pppd is a continuation of the same drop (isdup).
     for (i = 1; i <= n; i++) {
         k = K[i]; isdup[i] = 0; R[i] = ""
         if (k == "LCP") { R[i] = "LCP"; seen[P[i]] = 1 }
         else if (k == "TERM") {
-            R[i] = "команда"
+            R[i] = "command"
             for (j = 1; j <= ns; j++) {
                 d = T[i] - SL[j]; if (d < 0) d = -d
-                if (d <= 5) { R[i] = "сон"; break }
+                if (d <= 5) { R[i] = "sleep"; break }
             }
             seen[P[i]] = 1
         } else if (k == "CONN") {
-            if (P[i] in seen) isdup[i] = 1; else R[i] = "прочее"
+            if (P[i] in seen) isdup[i] = 1; else R[i] = "other"
             seen[P[i]] = 1
         }
     }
 
-    # Конечный автомат простоя. known: известно ли состояние VPN (до первого
-    # события VPN в окне ничего не считаем); down: VPN лежит; asleep: ноутбук спит.
+    # Outage state machine. known: whether the VPN state is known (nothing is
+    # counted before the first VPN event in the window); down: VPN is down; asleep: laptop is asleep.
     known = 0; down = 0; asleep = 0; total = 0; longest = 0; lstart = 0; lend = 0
     for (i = 1; i <= n; i++) {
         k = K[i]; t = T[i]
@@ -216,36 +217,36 @@ END {
             if (asleep) { asleep = 0; if (down) cs = t }
         }
     }
-    # Незакрытый простой: считаем до «сейчас», только если VPN сейчас не подключён.
+    # Unclosed outage: counted up to "now", only if the VPN is not connected now.
     if (down && !active) {
         if (!asleep) gacc += now - cs
         close_gap(now)
     }
 
-    # Вывод событий и обрывов.
+    # Output of events and drops.
     for (i = 1; i <= n; i++) {
         k = K[i]; t = T[i]; txt = ""
-        if (k == "UP") txt = "VPN подключён"
+        if (k == "UP") txt = "VPN connected"
         else if (k == "LCP" || k == "TERM" || (k == "CONN" && !isdup[i])) {
-            if (R[i] == "LCP") txt = "обрыв VPN: сервер перестал отвечать (LCP)"
-            else if (R[i] == "сон") txt = "обрыв VPN: уход в сон"
-            else if (R[i] == "команда") txt = "обрыв VPN: остановлен по команде"
-            else txt = "обрыв VPN: туннель завершён (прочее)"
+            if (R[i] == "LCP") txt = "VPN drop: server stopped responding (LCP)"
+            else if (R[i] == "sleep") txt = "VPN drop: suspend"
+            else if (R[i] == "command") txt = "VPN drop: stopped on command"
+            else txt = "VPN drop: tunnel terminated (other)"
             printf "D\t%.0f\t%s\n", int(t), R[i]
         }
-        else if (k == "SLEEP") txt = "уход в сон"
-        else if (k == "WAKE") txt = "выход из сна"
-        else if (k == "NMSTOP") txt = "перезапуск NetworkManager"
-        else if (k == "BOOT") txt = "загрузка системы"
-        else if (k == "FAIL") txt = "не удалось подключить VPN (таймаут)"
-        else if (k == "NOAGENT") txt = "не удалось запросить пароль VPN (нет агента)"
+        else if (k == "SLEEP") txt = "suspend"
+        else if (k == "WAKE") txt = "wake"
+        else if (k == "NMSTOP") txt = "NetworkManager restart"
+        else if (k == "BOOT") txt = "system boot"
+        else if (k == "FAIL") txt = "VPN connection failed (timeout)"
+        else if (k == "NOAGENT") txt = "VPN password request failed (no agent)"
         if (txt != "") printf "E\t%.0f\t%s\n", int(t), txt
     }
     printf "G\t%.0f\t%.0f\t%.0f\t%.0f\n", total, longest, lstart, lend
 }
 AWK
 
-# --- Основной код -------------------------------------------------------------
+# --- Main code ----------------------------------------------------------------
 SHOW_EVENTS=0
 ARG_HOURS=""
 HAVE_ARG=0
@@ -255,16 +256,16 @@ while (( $# > 0 )); do
         -h|--help) usage; exit 0 ;;
         --events)  SHOW_EVENTS=1 ;;
         -[0-9.,]*|[0-9.,]*|[!-]*)
-            # Отрицательные числа и любой не-флаг считаем значением «часы»,
-            # чтобы «-1» получило пояснение, а не ошибку.
+            # Negative numbers and any non-flag are treated as the "hours" value,
+            # so that "-1" gets a note rather than an error.
             if (( HAVE_ARG )); then
-                echo "Лишний аргумент: $1" >&2
+                echo "Extra argument: $1" >&2
                 usage >&2
                 exit 2
             fi
             ARG_HOURS=$1; HAVE_ARG=1 ;;
         *)
-            echo "Неизвестный параметр: $1" >&2
+            echo "Unknown option: $1" >&2
             usage >&2
             exit 2 ;;
     esac
@@ -284,7 +285,7 @@ trap 'rm -f "$JOURNAL"' EXIT
 
 NOW=$(date +%s)
 if ! journalctl --since "-${MINUTES}min" -o short-unix --no-pager -q >"$JOURNAL" 2>/dev/null; then
-    echo "Не удалось прочитать журнал (journalctl)." >&2
+    echo "Failed to read the journal (journalctl)." >&2
     exit 1
 fi
 
@@ -297,10 +298,10 @@ fi
 
 if vpn_active; then VPN_ACTIVE=1; else VPN_ACTIVE=0; fi
 
-# Разбор журнала автоматом: события, обрывы, простои.
+# Parse the journal with awk: events, drops, outages.
 RESULT=$(awk -v now="$NOW" -v active="$VPN_ACTIVE" "$AWK_PROG" "$JOURNAL")
 
-# Счётчики.
+# Counters.
 LCP=$(count "$RE_LCP")
 SIGNAL=$(count "$RE_TERM")
 CONN=$(count "$RE_CONN")
@@ -317,7 +318,7 @@ SLEEPS=$(count "$RE_SLEEP")
 NM_RESTARTS=$(count "$RE_NM_STOP")
 BOOTS=$(count "$RE_BOOT")
 
-# Простои.
+# Outages.
 IFS=$'\t' read -r _ DOWN_TOTAL DOWN_MAX GAP_FROM GAP_TO < <(awk -F'\t' '$1 == "G"' <<<"$RESULT")
 DOWN_TOTAL_TXT=$(fmt_duration "$DOWN_TOTAL")
 DOWN_MAX_TXT=$(fmt_duration "$DOWN_MAX")
@@ -325,14 +326,14 @@ if (( DOWN_MAX > 0 )); then
     DOWN_MAX_TXT+=" ($(fmt_time "$GAP_FROM") – $(fmt_time "$GAP_TO"))"
 fi
 
-# Последний Hello от сервера.
+# The last Hello from the server.
 HELLO_TXT="$HELLOS"
 if (( HELLOS > 0 )); then
     LAST_HELLO=$(grep -E -- "$RE_HELLO" "$JOURNAL" | tail -n1 | cut -d' ' -f1 || true)
-    HELLO_TXT+=" (последний $(fmt_time "${LAST_HELLO%%.*}"))"
+    HELLO_TXT+=" (last $(fmt_time "${LAST_HELLO%%.*}"))"
 fi
 
-# Последние 5 обрывов, самые свежие первыми.
+# The last 5 drops, newest first.
 RECENT=""
 while IFS=$'\t' read -r _ ts reason; do
     [[ -n $ts ]] || continue
@@ -340,49 +341,49 @@ while IFS=$'\t' read -r _ ts reason; do
 done < <(awk -F'\t' '$1 == "D"' <<<"$RESULT" | tail -n 5 | tac)
 [[ -n $RECENT ]] || RECENT="—"
 
-# --- Вывод --------------------------------------------------------------------
+# --- Output -------------------------------------------------------------------
 if [[ -n $NOTE ]]; then
     printf '%s\n\n' "$NOTE"
 fi
 
-printf '**Период:** %s (%s)\n\n' "$PERIOD" "$(period_label "$HALFHOURS")"
+printf '**Period:** %s (%s)\n\n' "$PERIOD" "$(period_label "$HALFHOURS")"
 
-echo "### Статистика"
+echo "### Statistics"
 echo
-echo "| Показатель | Значение |"
+echo "| Metric | Value |"
 echo "|---|---:|"
-echo "| Разрывов VPN всего | $TOTAL |"
-echo "|   • сервер перестал отвечать (LCP) | $LCP |"
-echo "|   • по команде: сон, nmcli down, сторож | $SIGNAL |"
-echo "|   • прочие | $OTHER |"
-echo "| Попыток подключения VPN | $STARTS |"
-echo "| Успешных подключений | $OKS |"
-echo "| Неудачных подключений (таймаут) | $FAILS |"
-echo "| Ошибок запроса пароля (нет агента) | $NOAGENTS |"
-echo "| Суммарно без VPN | $DOWN_TOTAL_TXT |"
-echo "| Самый долгий простой | $DOWN_MAX_TXT |"
-echo "| Hello от сервера L2TP | $HELLO_TXT |"
-echo "| Wi-Fi: отключений | $WIFI_DOWN |"
-echo "| Wi-Fi: сбросов из-за неудачи VPN | $WIFI_RESET |"
-echo "| Уходов в сон | $SLEEPS |"
-echo "| Перезапусков NetworkManager | $NM_RESTARTS |"
-echo "| Загрузок системы | $BOOTS |"
-echo "| Последние обрывы | $RECENT |"
+echo "| VPN drops, total | $TOTAL |"
+echo "|   • server stopped responding (LCP) | $LCP |"
+echo "|   • on command: sleep, nmcli down, watchdog | $SIGNAL |"
+echo "|   • other | $OTHER |"
+echo "| VPN connection attempts | $STARTS |"
+echo "| Successful connections | $OKS |"
+echo "| Failed connections (timeout) | $FAILS |"
+echo "| Password request errors (no agent) | $NOAGENTS |"
+echo "| Total time without VPN | $DOWN_TOTAL_TXT |"
+echo "| Longest outage | $DOWN_MAX_TXT |"
+echo "| Hello from L2TP server | $HELLO_TXT |"
+echo "| Wi-Fi: disconnects | $WIFI_DOWN |"
+echo "| Wi-Fi: resets after VPN failure | $WIFI_RESET |"
+echo "| Suspends | $SLEEPS |"
+echo "| NetworkManager restarts | $NM_RESTARTS |"
+echo "| System boots | $BOOTS |"
+echo "| Last drops | $RECENT |"
 echo
 
-if (( VPN_ACTIVE )); then VPN_NOW="подключён"; else VPN_NOW="не подключён"; fi
-echo "### Сейчас"
+if (( VPN_ACTIVE )); then VPN_NOW="connected"; else VPN_NOW="disconnected"; fi
+echo "### Now"
 echo
-echo "| Показатель | Значение |"
+echo "| Metric | Value |"
 echo "|---|---:|"
 echo "| $VPN_NAME | $VPN_NOW |"
 echo "| Kill switch (vpn-killswitch.service) | $(unit_state systemctl is-active vpn-killswitch.service) |"
-echo "| Сторож (old-vpn-watchdog.service) | $(unit_state systemctl --user is-active old-vpn-watchdog.service) |"
-echo "| Заблокировано kill switch, пакетов | $(killswitch_drops) |"
+echo "| Watchdog (old-vpn-watchdog.service) | $(unit_state systemctl --user is-active old-vpn-watchdog.service) |"
+echo "| Blocked by kill switch, packets | $(killswitch_drops) |"
 
 if (( SHOW_EVENTS )); then
     echo
-    echo "**События:**"
+    echo "**Events:**"
     echo
     EV_COUNT=0
     while IFS=$'\t' read -r _ ts text; do
@@ -391,7 +392,7 @@ if (( SHOW_EVENTS )); then
         printf -- '- %s  %s\n' "$(fmt_time "$ts")" "$text"
     done < <(awk -F'\t' '$1 == "E"' <<<"$RESULT")
     if (( EV_COUNT == 0 )); then
-        echo "- событий нет"
+        echo "- no events"
     fi
 fi
 

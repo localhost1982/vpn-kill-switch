@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Устанавливает и включает VPN kill switch (nftables + systemd).
-# Берёт killswitch.nft и vpn-killswitch.service из папки скрипта.
+# Installs and enables the VPN kill switch (nftables + systemd).
+# Takes killswitch.nft and vpn-killswitch.service from the script's directory.
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,27 +17,27 @@ fi
 
 for f in "$NFT_SRC" "$UNIT_SRC"; do
     if [[ ! -f "$f" ]]; then
-        echo "Не найден файл: $f" >&2
+        echo "File not found: $f" >&2
         exit 1
     fi
 done
 
-echo "==> Проверка синтаксиса правил"
+echo "==> Checking rules syntax"
 nft -c -f "$NFT_SRC"
 
-echo "==> Копирование файлов"
+echo "==> Copying files"
 install -D -m 0644 "$NFT_SRC" "$NFT_DST"
 install -D -m 0644 "$UNIT_SRC" "$UNIT_DST"
 
-echo "==> Включение сервиса"
+echo "==> Enabling the service"
 systemctl daemon-reload
 systemctl enable --now "$UNIT_NAME"
 
-echo "==> Состояние"
+echo "==> Status"
 systemctl --no-pager --lines=0 status "$UNIT_NAME" || true
 echo
 nft list table inet killswitch
 
 echo
-echo "Kill switch включён. Интернет теперь только через VPN-L2TP (ppp*)."
-echo "Отключить: $SRC_DIR/uninstall.sh"
+echo "Kill switch enabled. Internet is now reachable only through VPN-L2TP (ppp*)."
+echo "To disable: $SRC_DIR/uninstall.sh"

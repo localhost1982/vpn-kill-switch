@@ -5,8 +5,8 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-# Под Wayland приложение не может расположить своё окно; через XWayland
-# окно настроек открывается по центру экрана.
+# Under Wayland an application cannot position its own window; via XWayland
+# the settings window opens centered on the screen.
 Environment=GDK_BACKEND=x11
 ExecStart=/usr/bin/python3 @TRAY_DIR@/vpn-tray.py
 Restart=on-failure

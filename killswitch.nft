@@ -1,30 +1,30 @@
 #!/usr/sbin/nft -f
 #
-# VPN kill switch для VPN-L2TP (nm-l2tp: strongSwan + kl2tpd + pppd).
+# VPN kill switch for VPN-L2TP (nm-l2tp: strongSwan + kl2tpd + pppd).
 #
-# Принцип: наружу (Wi-Fi, Ethernet, любой другой физический интерфейс)
-# разрешены только пакеты, нужные для установления самого VPN, и локальная
-# сеть. Весь остальной трафик должен идти через ppp* (туннель VPN-L2TP).
-# Если VPN упал, маршрут по умолчанию возвращается на Wi-Fi, но правила
-# ниже его блокируют. Если VPN "завис" (ppp1 жив, но мёртв), трафик и так
-# уходит в мёртвый туннель и никуда не утекает.
+# Principle: outbound on Wi-Fi, Ethernet or any other physical interface,
+# only the packets needed to establish the VPN itself and the local network
+# are allowed. All other traffic must go through ppp* (the VPN-L2TP tunnel).
+# If the VPN drops, the default route falls back to Wi-Fi, but the rules
+# below block it. If the VPN hangs (ppp1 is up but dead), traffic goes
+# into the dead tunnel anyway and does not leak.
 #
-# Файл идемпотентен: при каждом запуске своя таблица пересоздаётся,
-# чужие таблицы (Docker, ufw) не трогаются. Ничего не flush-ит глобально.
+# This file is idempotent: on every load its own table is recreated,
+# other tables (Docker, ufw) are left untouched. Nothing is flushed globally.
 
 table inet killswitch
 delete table inet killswitch
 
 table inet killswitch {
 
-	# Сервер VPN-L2TP: vpn.example.com. Если у него сменится IP, обновить здесь.
+	# VPN-L2TP server: vpn.example.com. If its IP changes, update it here.
 	set vpn_server {
 		type ipv4_addr
 		elements = { 203.0.113.10 }
 	}
 
-	# Локальные сети, разрешённые без VPN: роутер, локальный DNS,
-	# принтеры, Docker-подсети, mDNS/мультикаст.
+	# Local networks allowed without VPN: router, local DNS,
+	# printers, Docker subnets, mDNS/multicast.
 	set lan {
 		type ipv4_addr
 		flags interval
@@ -40,28 +40,28 @@ table inet killswitch {
 	chain output {
 		type filter hook output priority filter + 10; policy accept;
 
-		# Интерфейсы, где ограничений нет
+		# Interfaces with no restrictions
 		oifname "lo" accept
-		oifname "ppp*" accept comment "туннель VPN-L2TP"
+		oifname "ppp*" accept comment "VPN-L2TP tunnel"
 		oifname "docker0" accept
-		oifname "br-*" accept comment "сети docker compose"
+		oifname "br-*" accept comment "docker compose networks"
 		oifname "veth*" accept
 
-		# Всё ниже относится к любому другому интерфейсу:
-		# Wi-Fi, Ethernet, USB-модем, новая сетевуха и т.д.
+		# Everything below applies to any other interface:
+		# Wi-Fi, Ethernet, USB modem, a new NIC, etc.
 
 		udp sport 68 udp dport 67 accept comment "DHCP"
-		ip daddr @vpn_server udp dport { 500, 4500 } accept comment "IKE и IPsec NAT-T до сервера VPN"
-		# L2TP проходит через output ДО шифрования IPsec, как обычный UDP 1701
-		# на адрес сервера. Потом ядро заворачивает его в ESP (UDP 4500).
-		ip daddr @vpn_server udp dport 1701 accept comment "L2TP до шифрования IPsec"
-		ip daddr @lan accept comment "локальная сеть и локальный DNS"
+		ip daddr @vpn_server udp dport { 500, 4500 } accept comment "IKE and IPsec NAT-T to the VPN server"
+		# L2TP passes through output BEFORE IPsec encryption, as plain UDP 1701
+		# to the server address. The kernel then wraps it in ESP (UDP 4500).
+		ip daddr @vpn_server udp dport 1701 accept comment "L2TP before IPsec encryption"
+		ip daddr @lan accept comment "local network and local DNS"
 		ip6 daddr { fe80::/10, ff00::/8 } accept comment "IPv6 link-local (NDP, RA)"
 
-		counter drop comment "KILL SWITCH: интернет без VPN заблокирован"
+		counter drop comment "KILL SWITCH: internet without VPN is blocked"
 	}
 
-	# Трафик, который ноутбук пересылает (Docker-контейнеры наружу).
+	# Traffic the laptop forwards (Docker containers going outbound).
 	chain forward {
 		type filter hook forward priority filter + 10; policy accept;
 
@@ -71,6 +71,6 @@ table inet killswitch {
 		oifname "veth*" accept
 		ip daddr @lan accept
 
-		counter drop comment "KILL SWITCH: контейнеры без VPN заблокированы"
+		counter drop comment "KILL SWITCH: containers without VPN are blocked"
 	}
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Выключает и удаляет VPN kill switch (nftables + systemd).
+# Disables and removes the VPN kill switch (nftables + systemd).
 set -euo pipefail
 
 NFT_DST="/etc/nftables.d/killswitch.nft"
@@ -10,26 +10,26 @@ if [[ $EUID -ne 0 ]]; then
     exec sudo -- "$0" "$@"
 fi
 
-echo "==> Остановка и отключение сервиса"
+echo "==> Stopping and disabling the service"
 if systemctl list-unit-files "$UNIT_NAME" --no-legend 2>/dev/null | grep -q "$UNIT_NAME"; then
     systemctl disable --now "$UNIT_NAME" || true
 else
-    echo "Сервис $UNIT_NAME не установлен, пропускаю."
+    echo "Service $UNIT_NAME is not installed, skipping."
 fi
 
-echo "==> Удаление таблицы nftables (если осталась)"
+echo "==> Removing the nftables table (if still present)"
 if nft list table inet killswitch >/dev/null 2>&1; then
     nft delete table inet killswitch
 fi
 
-echo "==> Удаление файлов"
+echo "==> Removing files"
 rm -f "$NFT_DST" "$UNIT_DST"
 rmdir /etc/nftables.d 2>/dev/null || true
 systemctl daemon-reload
 
-echo "==> Проверка"
+echo "==> Verification"
 if nft list table inet killswitch >/dev/null 2>&1; then
-    echo "Таблица inet killswitch всё ещё есть!" >&2
+    echo "Table inet killswitch still exists!" >&2
     exit 1
 fi
-echo "Kill switch выключен и удалён. Трафик снова ходит без ограничений."
+echo "Kill switch disabled and removed. Traffic is no longer restricted."

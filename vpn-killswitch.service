@@ -1,6 +1,6 @@
 [Unit]
 Description=VPN kill switch (nftables): internet only via VPN-L2TP
-# Поднимаем правила до того, как NetworkManager начнёт поднимать сеть.
+# Load the rules before NetworkManager brings the network up.
 DefaultDependencies=no
 After=local-fs.target
 Before=network-pre.target
