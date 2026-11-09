@@ -508,7 +508,8 @@ is the profile selected in the Settings window.
 | `network-wired-disconnected-symbolic` | the profile is not connected, or no profile is selected |
 
 **Menu** (the lines only display data and are refreshed when the menu is opened and by timers;
-clicking the `Kill switch: …` line opens the "Dropped packets" window, see below):
+clicking the `Kill switch: …` line opens the "Dropped packets" window and clicking the
+`VPN drops since boot: …` line opens the "VPN drops" window, see below):
 
 - `VPN: connected 4h 12m (My VPN)` or `VPN: disconnected (My VPN)` (`My VPN` stands for the name of the selected
   profile; while connecting: `VPN: connecting… (My VPN)`). The time is counted
@@ -525,7 +526,8 @@ clicking the `Kill switch: …` line opens the "Dropped packets" window, see bel
 - `VPN drops since boot: 1 (server silent: 0)`. The logic is the same as in `vpn-stats.sh`:
   the total is the larger of the number of `Connection terminated` and the sum of the causes, and the
   number in parentheses is the count of `No response to N echo-requests`. These are pppd
-  messages, so for VPN types without pppd the line stays at 0;
+  messages, so for VPN types without pppd the line stays at 0. Clicking this line opens the
+  "VPN drops" window (see below);
 - `Reconnect VPN` brings the selected profile down (if it is active) and up again with `nmcli`, in the background
   (it is unavailable while no profile is selected);
 - `Settings…` opens the settings window (see "Settings" below);
@@ -545,6 +547,7 @@ and for days `1d 03h`.
 | Packets dropped | `journalctl -q -o short-unix --no-pager --grep ^KS-DROP -b _TRANSPORT=kernel`, the number of lines (no `sudo`) | when the menu is opened and every 60 s |
 | VPN drops | `journalctl -b -q -o cat _COMM=pppd` | every 60 s |
 | Dropped packets window | `journalctl -q -o short-unix --grep ^KS-DROP _TRANSPORT=kernel` | when the window is opened, on `Refresh` and when the period changes |
+| VPN drops window | two `journalctl -q -o short-unix` queries: pppd and NetworkManager lines, then the kernel suspend, wake and boot lines | when the window is opened, on `Refresh` and when the period changes |
 
 ### Dropped packets window
 
@@ -584,6 +587,62 @@ With the `Since boot` period the number in this line is the same as the number i
 nftables counter (`vpn-stats.sh`, `sudo nft list table inet killswitch`) is not shown in the tray; it
 starts from zero whenever the rules are loaded, while the journal keeps its lines across reloads.
 Packets dropped before the `log` rules were installed are not visible in the journal at all.
+
+### VPN drops window
+
+A click on the `VPN drops since boot: …` menu line opens the "VPN drops" window in the center of the
+screen: the chronology of the drops and reconnections of the selected VPN profile. It shows when the
+VPN dropped, why, when it came back and how long it was down. Choosing the line again brings the open
+window to the front; Escape and `Close` close it. The window needs read access to the journal (the user
+must be in the `adm` or `systemd-journal` group). If no profile is selected in Settings, it reads
+`No VPN profile selected`.
+
+- **Period**: the same as in the "Dropped packets" window: `Last hour`, `Last 6 hours`, `Last 24 hours`,
+  `This session` (since the tray icon was started) or `Since boot` (the default). The list is reloaded
+  when the period changes; **Refresh** reloads it, **Close** closes the window. The controls are
+  unavailable while it loads;
+- **Columns**: `Time` (`HH:MM:SS` for today, `YYYY-MM-DD HH:MM:SS` otherwise), `Event`, `Details` and
+  `Downtime`. The newest rows come first; click a column header to sort by it. Drops are in bold.
+
+**Events:**
+
+| Event | Details | Journal line |
+|---|---|---|
+| `Drop` | `server stopped responding (LCP)` | pppd `No response to N echo-requests` |
+| `Drop` | `on command` | pppd `Terminating on signal` (`nmcli connection down`, the watchdog, a manual stop) |
+| `Drop` | `suspend` | the same line within 5 s of a suspend |
+| `Drop` | `other` | pppd `Connection terminated.` without any of the causes above |
+| `Connected` | `default route via ppp0` (the interface name) | NetworkManager `policy: set '<profile>' (ppp0) as default for IPv4` |
+| `Connecting` | `starting` | NetworkManager `vpn[...,"<profile>"]: starting ...` |
+| `Connect failed` | `timeout` | NetworkManager `vpn[...,"<profile>"]: failed to connect` |
+| `Connect failed` | `no password agent` | NetworkManager `failed to request VPN secrets` |
+| `Suspend`, `Wake` | | kernel `PM: suspend entry`, `PM: suspend exit` |
+| `NetworkManager restart` | | systemd `Stopped NetworkManager.service` |
+| `Boot` | | kernel `Linux version` |
+
+The data comes from two journal queries one after the other: the lines of pppd and NetworkManager
+(plus the systemd lines about `NetworkManager.service`), then the kernel suspend, wake and boot lines.
+They are merged by time.
+
+**Downtime** is filled in only for the drop that started an outage: the time from that drop to the next
+successful connection (`Connected`), without the time the computer was suspended. While the VPN is
+still down it reads `ongoing`. Further drops before the VPN is back belong to the same outage and
+have an empty `Downtime`, like all the other events. A pppd message that repeats a drop already
+listed (`Connection terminated.` after `No response` or `Terminating` of the same pppd process) is not
+a new row. A drop with no `Connected` after it while the VPN is connected now (for example the old
+tunnel closing after the new one came up) has an empty `Downtime` too.
+
+The line at the bottom reads, for example,
+`7 drops (server silent: 2) · total time without VPN: 8m 34s · longest: 3m 51s`
+(`1 drop` for a single one), or `No VPN drops in this period` (the other events are still listed).
+While the list loads it reads `Loading…`; if the journal cannot be read, `Failed to read the journal: …`.
+
+The logic is the same as in `vpn-stats.sh` (see "Drop statistics"): the same patterns, the same drop
+total (the larger of the number of `Connection terminated` and the sum of the causes, as in the menu
+line), the same outage state machine for the downtime. The `Drop` rows are the individual drops, so in
+rare cases their number can differ from the total in the bottom line. Drop causes exist only for pppd-based
+profiles (L2TP, PPTP); for other VPN types the window lists only the connection events (`Connecting`,
+`Connected`, `Connect failed`), suspends and boots.
 
 ### Requirements
 

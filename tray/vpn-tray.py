@@ -256,6 +256,170 @@ def count_logged_drops():
     return None
 
 
+# --- VPN drops: the pppd and NetworkManager journal lines (the same logic as vpn-stats.sh) ---
+
+def vpn_patterns(name):
+    """Compiled journal line patterns (`journalctl -o short-unix`, i.e. with the "unit[pid]: " prefix),
+    the same set as the RE_* variables of vpn-stats.sh. The profile name is escaped."""
+    n = re.escape(name)
+    return {
+        "noagent": re.compile(r"secrets: failed to request VPN secrets"),
+        "lcp": re.compile(r"pppd\[[0-9]+\]: No response to [0-9]+ echo-requests"),
+        "term": re.compile(r"pppd\[[0-9]+\]: Terminating on signal"),
+        "conn": re.compile(r"pppd\[[0-9]+\]: Connection terminated\."),
+        "sleep": re.compile(r"kernel: PM: suspend entry"),
+        "wake": re.compile(r"kernel: PM: suspend exit"),
+        "nmstop": re.compile(r"systemd\[1\]: Stopped NetworkManager\.service"),
+        "boot": re.compile(r"kernel: Linux version "),
+        "start": re.compile(r'vpn\[[^]]*"' + n + r'"\]: starting '),
+        "up": re.compile(r"policy: set '" + n + r"' \(([a-z0-9]+)\) as default for IPv4"),
+        "fail": re.compile(r'vpn\[[^]]*"' + n + r'"\]: failed to connect'),
+    }
+
+
+RE_PPPD_PID = re.compile(r"pppd\[([0-9]+)\]")
+VPN_DROP_DETAILS = {
+    "LCP": "server stopped responding (LCP)",
+    "command": "on command",
+    "sleep": "suspend",
+    "other": "other",
+}
+
+
+def vpn_events(lines, name, now, vpn_active):
+    """Chronology of VPN drops and reconnections of the profile `name` from journal lines
+    (`journalctl -o short-unix`, the pppd, NetworkManager and kernel suspend lines, in any order).
+
+    Returns (events, summary). events: chronological list of dicts {time, kind, detail, downtime};
+    kind is Drop / Connected / Connecting / Connect failed / Suspend / Wake / NetworkManager restart / Boot.
+    For a Drop, "opens_gap" is True when it started an outage (the VPN was up, or unknown, before it);
+    only that drop has a downtime: seconds until the next successful connection without suspend time,
+    or None while the outage is still going on. Further drops of the same outage have opens_gap False.
+    summary: drops, lcp, signal, other, attempts, successes, failures, noagent, downtime_total,
+    downtime_longest (seconds). The counts and the outage state machine are those of vpn-stats.sh:
+    nothing is counted before the first VPN event; "Connection terminated" after a "No response" or
+    "Terminating" of the same pppd is the same drop; a "Terminating" within 5 s of a suspend is a
+    suspend drop; an open outage is counted up to `now` only if the VPN is not connected now.
+    """
+    rx = vpn_patterns(name)
+    anyrx = re.compile("|".join(r.pattern for r in rx.values()))
+    cnt = dict.fromkeys(rx, 0)
+    items = []  # (time, kind, pid, iface)
+    for line in lines:
+        head = line.split(None, 1)
+        try:
+            t = float(head[0])
+        except (ValueError, IndexError):
+            continue
+        if not anyrx.search(line):
+            continue
+        for key, r in rx.items():  # every pattern is counted on its own, like `grep -c` in vpn-stats.sh
+            if r.search(line):
+                cnt[key] += 1
+        kind = iface = None
+        m = rx["up"].search(line)
+        if m:
+            kind, iface = "UP", m.group(1)
+        else:
+            for key, k in (("lcp", "LCP"), ("term", "TERM"), ("conn", "CONN"), ("start", "START"),
+                           ("fail", "FAIL"), ("noagent", "NOAGENT"), ("sleep", "SLEEP"), ("wake", "WAKE"),
+                           ("nmstop", "NMSTOP"), ("boot", "BOOT")):
+                if rx[key].search(line):
+                    kind = k
+                    break
+        if kind is None:
+            continue
+        pid = ""
+        if kind in ("LCP", "TERM", "CONN"):
+            pm = RE_PPPD_PID.search(line)
+            pid = pm.group(1) if pm else ""
+        items.append((t, kind, pid, iface))
+    items.sort(key=lambda it: it[0])  # stable: lines with the same timestamp keep their order
+
+    sleeps = [t for t, k, _p, _i in items if k == "SLEEP"]
+    seen = set()
+    events = []
+    known = down = asleep = False
+    total = longest = gacc = cs = 0.0
+    gap_ev = None  # the event that opened the current outage
+
+    def close_gap(dur):
+        nonlocal total, longest
+        total += dur
+        longest = max(longest, dur)
+
+    for t, k, pid, iface in items:
+        ev = {"time": t, "kind": "", "detail": "", "downtime": None}
+        if k in ("LCP", "TERM", "CONN"):
+            if k == "LCP":
+                reason = "LCP"
+            elif k == "TERM":
+                reason = "sleep" if any(abs(t - s) <= 5 for s in sleeps) else "command"
+            else:
+                reason = None if pid in seen else "other"  # None: a continuation of the same drop
+            seen.add(pid)
+            if reason is None:
+                continue
+            ev["kind"], ev["detail"], ev["opens_gap"] = "Drop", VPN_DROP_DETAILS[reason], False
+            if not down:
+                known = down = True
+                gacc = 0.0
+                cs = t
+                ev["opens_gap"] = True
+                gap_ev = ev
+        elif k == "UP":
+            ev["kind"], ev["detail"] = "Connected", "default route via " + iface
+            if not known:
+                known, down = True, False
+            elif down:
+                if not asleep:
+                    gacc += t - cs
+                close_gap(gacc)
+                gap_ev["downtime"] = round(gacc)
+                down = False
+        elif k == "SLEEP":
+            ev["kind"] = "Suspend"
+            if not asleep:
+                if down:
+                    gacc += t - cs
+                asleep = True
+        elif k == "WAKE":
+            ev["kind"] = "Wake"
+            if asleep:
+                asleep = False
+                if down:
+                    cs = t
+        elif k == "START":
+            ev["kind"], ev["detail"] = "Connecting", "starting"
+        elif k == "FAIL":
+            ev["kind"], ev["detail"] = "Connect failed", "timeout"
+        elif k == "NOAGENT":
+            ev["kind"], ev["detail"] = "Connect failed", "no password agent"
+        elif k == "NMSTOP":
+            ev["kind"] = "NetworkManager restart"
+        else:
+            ev["kind"] = "Boot"
+        events.append(ev)
+
+    # An open outage is counted up to now, only if the VPN is not connected now.
+    if down:
+        if not vpn_active:
+            if not asleep:
+                gacc += now - cs
+            close_gap(gacc)  # gap_ev["downtime"] stays None: ongoing
+        else:
+            gap_ev["opens_gap"] = False  # the VPN is up although no connection event closed the outage
+
+    lcp, sig = cnt["lcp"], cnt["term"]
+    drops = max(cnt["conn"], lcp + sig)
+    summary = {
+        "drops": drops, "lcp": lcp, "signal": sig, "other": drops - lcp - sig,
+        "attempts": cnt["start"], "successes": cnt["up"], "failures": cnt["fail"], "noagent": cnt["noagent"],
+        "downtime_total": round(total), "downtime_longest": round(longest),
+    }
+    return events, summary
+
+
 def fmt_time(ts):
     """Epoch -> "HH:MM:SS" for today, "YYYY-MM-DD HH:MM:SS" otherwise (local time)."""
     t = time.localtime(ts)
@@ -393,6 +557,7 @@ class Tray:
         self.ks_active = None   # True/False, None if `systemctl is-active` failed to run
         self.settings_win = None  # settings window while it is open
         self.drops_win = None   # "Dropped packets" window while it is open
+        self.vpn_drops_win = None  # "VPN drops" window while it is open
         self.ks_text = "Kill switch: checking…"
         self.drops_text = "VPN drops since boot: checking…"
 
@@ -410,6 +575,8 @@ class Tray:
         # Clicking the kill switch line opens the "Dropped packets" window.
         self.item_ks.connect("activate", self.open_drops_window)
         self.item_drops = Gtk.MenuItem(label=self.drops_text)
+        # Clicking the VPN drops line opens the "VPN drops" window.
+        self.item_drops.connect("activate", self.open_vpn_drops_window)
         self.item_reconnect = Gtk.MenuItem(label="Reconnect VPN")
         self.item_reconnect.connect("activate", self.on_reconnect)
         item_settings = Gtk.MenuItem(label="Settings…")
@@ -511,6 +678,17 @@ class Tray:
     def on_drops_destroy(self, *_):
         self.drops_win = None
 
+    def open_vpn_drops_window(self, *_):
+        if self.vpn_drops_win is not None:
+            self.vpn_drops_win.present()
+            return
+        win = VpnDropsWindow(self)
+        win.connect("destroy", self.on_vpn_drops_destroy)
+        self.vpn_drops_win = win
+
+    def on_vpn_drops_destroy(self, *_):
+        self.vpn_drops_win = None
+
     # --- VPN ----------------------------------------------------------------
 
     def vpn_connections(self):
@@ -556,6 +734,15 @@ class Tray:
 
     def find_active(self):
         return self.find_active_uuid(self.vpn_uuid)
+
+    def vpn_activated(self):
+        """True if the selected profile is connected right now (an active connection in the ACTIVATED state)."""
+        try:
+            ac = self.find_active()
+            return ac is not None and ac.get_state() == NM.ActiveConnectionState.ACTIVATED
+        except Exception as e:
+            log("VPN state: %s" % e)
+            return False
 
     def watch_active(self, ac):
         """Subscribe to state changes of the active connection that was found."""
@@ -989,8 +1176,10 @@ class SettingsWindow(Gtk.Window):
             self.show_error("Failed to %s the kill switch: %s" % (verb, stderr[:300]))
 
 
-class DropsWindow(Gtk.Window):
-    """Dropped packets: the kernel log lines of the kill switch `log` rules, read from the journal."""
+class JournalWindow(Gtk.Window):
+    """Base of the journal windows (Dropped packets, VPN drops): the period combo, the Refresh and Close
+    buttons, Escape, the table in a scrolled window, the status line and the loading state.
+    A subclass fills the table and starts the journal queries in reload()."""
 
     PERIODS = (  # id, label, journalctl arguments
         ("1h", "Last hour", ["--since", "-1h"]),
@@ -999,28 +1188,17 @@ class DropsWindow(Gtk.Window):
         ("session", "This session", None),  # since the tray started, computed in session_args()
         ("boot", "Since boot", ["-b"]),
     )
-    # Column titles and the store column each header sorts by. The store rows are
-    # [display strings..., epoch (float), count (int), dst IP (str)]; Host is always a display column.
-    GROUPED_COLUMNS = ("Last seen", "Count", "Proto", "Destination", "Interface", "User", "Host")
-    RAW_COLUMNS = ("Time", "Proto", "Source", "Destination", "Interface", "User", "Flags", "Chain", "Host")
-    RESOLVE_THREADS = 4
-    RESOLVE_TIMEOUT = 2.0
 
-    def __init__(self, tray):
+    def __init__(self, tray, title, options=()):
+        """options: [(widget, padding)] packed in the top row between the period combo and the buttons."""
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.tray = tray
         self.closed = False
         self.loading = False
         self.proc = None            # reference to the Gio.Subprocess while it runs
-        self.records = []           # parsed log lines of the last load
-        self.store = None           # the Gtk.ListStore behind the current table
-        self.sorted_model = None
-        self.sort_state = {}        # view mode -> (sort column, order), kept across reloads
-        self.host_cache = {}        # dst IP -> host name ("" if it did not resolve), for the window's lifetime
-        self.resolving = set()      # dst IPs being resolved right now
-        self.host_update_id = 0     # pending GLib source that refreshes the Host column
+        self.option_widgets = [w for w, _pad in options]
 
-        self.set_title("Dropped packets")
+        self.set_title(title)
         self.set_default_size(820, 440)
         self.set_resizable(True)
         self.set_position(Gtk.WindowPosition.CENTER)
@@ -1034,18 +1212,14 @@ class DropsWindow(Gtk.Window):
         for pid, label, _args in self.PERIODS:
             self.period_combo.append(pid, label)
         self.period_combo.set_active_id("boot")
-        self.group_check = Gtk.CheckButton(label="Group identical flows")
-        self.group_check.set_active(True)
-        self.resolve_check = Gtk.CheckButton(label="Resolve hostnames")
-        self.resolve_check.set_active(False)
         self.btn_refresh = Gtk.Button(label="Refresh")
         btn_close = Gtk.Button(label="Close")
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         top.pack_start(Gtk.Label(label="Period:"), False, False, 0)
         top.pack_start(self.period_combo, False, False, 0)
-        top.pack_start(self.group_check, False, False, 6)
-        top.pack_start(self.resolve_check, False, False, 0)
+        for widget, padding in options:
+            top.pack_start(widget, False, False, padding)
         top.pack_start(Gtk.Box(), True, True, 0)  # spacer
         top.pack_start(self.btn_refresh, False, False, 0)
         top.pack_start(btn_close, False, False, 0)
@@ -1069,20 +1243,11 @@ class DropsWindow(Gtk.Window):
         self.add(box)
 
         self.period_combo.connect("changed", lambda *_: self.reload())
-        self.group_check.connect("toggled", self.on_group_toggled)
-        self.resolve_check.connect("toggled", self.on_resolve_toggled)
         self.btn_refresh.connect("clicked", lambda *_: self.reload())
         btn_close.connect("clicked", lambda *_: self.destroy())
 
-        self.render()
-        self.show_all()
-        self.reload()
-
     def on_destroy(self, *_):
         self.closed = True
-        if self.host_update_id:
-            GLib.source_remove(self.host_update_id)
-            self.host_update_id = 0
 
     def on_key_press(self, widget, event):
         if event.keyval == Gdk.KEY_Escape:
@@ -1090,11 +1255,9 @@ class DropsWindow(Gtk.Window):
             return True
         return False
 
-    # --- loading -------------------------------------------------------------
-
     def set_loading(self, value):
         self.loading = value
-        for w in (self.period_combo, self.group_check, self.resolve_check, self.btn_refresh):
+        for w in (self.period_combo, *self.option_widgets, self.btn_refresh):
             w.set_sensitive(not value)
 
     def session_args(self):
@@ -1102,12 +1265,60 @@ class DropsWindow(Gtk.Window):
         since = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.tray.started))
         return ["--since", since]
 
+    def period_args(self):
+        """journalctl arguments of the selected period."""
+        args = next(a for pid, _l, a in self.PERIODS if pid == self.period_combo.get_active_id())
+        return self.session_args() if args is None else args
+
+    def reload(self):
+        raise NotImplementedError
+
+
+class DropsWindow(JournalWindow):
+    """Dropped packets: the kernel log lines of the kill switch `log` rules, read from the journal."""
+
+    # Column titles and the store column each header sorts by. The store rows are
+    # [display strings..., epoch (float), count (int), dst IP (str)]; Host is always a display column.
+    GROUPED_COLUMNS = ("Last seen", "Count", "Proto", "Destination", "Interface", "User", "Host")
+    RAW_COLUMNS = ("Time", "Proto", "Source", "Destination", "Interface", "User", "Flags", "Chain", "Host")
+    RESOLVE_THREADS = 4
+    RESOLVE_TIMEOUT = 2.0
+
+    def __init__(self, tray):
+        group_check = Gtk.CheckButton(label="Group identical flows")
+        group_check.set_active(True)
+        resolve_check = Gtk.CheckButton(label="Resolve hostnames")
+        resolve_check.set_active(False)
+        super().__init__(tray, "Dropped packets", options=[(group_check, 6), (resolve_check, 0)])
+        self.group_check = group_check
+        self.resolve_check = resolve_check
+        self.records = []           # parsed log lines of the last load
+        self.store = None           # the Gtk.ListStore behind the current table
+        self.sorted_model = None
+        self.sort_state = {}        # view mode -> (sort column, order), kept across reloads
+        self.host_cache = {}        # dst IP -> host name ("" if it did not resolve), for the window's lifetime
+        self.resolving = set()      # dst IPs being resolved right now
+        self.host_update_id = 0     # pending GLib source that refreshes the Host column
+
+        self.group_check.connect("toggled", self.on_group_toggled)
+        self.resolve_check.connect("toggled", self.on_resolve_toggled)
+
+        self.render()
+        self.show_all()
+        self.reload()
+
+    def on_destroy(self, *_):
+        super().on_destroy()
+        if self.host_update_id:
+            GLib.source_remove(self.host_update_id)
+            self.host_update_id = 0
+
+    # --- loading -------------------------------------------------------------
+
     def reload(self):
         if self.closed or self.loading:
             return
-        period_args = next(a for pid, _l, a in self.PERIODS if pid == self.period_combo.get_active_id())
-        if period_args is None:
-            period_args = self.session_args()
+        period_args = self.period_args()
         self.set_loading(True)
         self.status.set_text("Loading…")
         # `_TRANSPORT=kernel` instead of `-k`: `-k` implies `-b`, which would cut the
@@ -1254,6 +1465,125 @@ class DropsWindow(Gtk.Window):
             host = self.hostname(row[self.dst_col])
             if row[self.host_col] != host:
                 row[self.host_col] = host
+
+
+class VpnDropsWindow(JournalWindow):
+    """VPN drops: the chronology of drops and reconnections of the selected profile, built from the pppd,
+    NetworkManager and kernel suspend lines of the journal (see vpn_events())."""
+
+    COLUMNS = ("Time", "Event", "Details", "Downtime")
+    BOLD, NORMAL = 700, 400  # Pango weights; Drop rows are bold
+    ONGOING_SORT = 1e18      # sort key of an "ongoing" downtime (the longest); rows without one use -1
+    # Store: [Time, Event, Details, Downtime | epoch, weight, downtime sort key]; each header sorts by
+    # its own display column, except Time (epoch) and Downtime (seconds).
+    COLUMN_SORT_IDS = (4, 1, 2, 6)
+
+    # Journal queries. The "+" is journalctl's OR between groups of matches: pppd lines, NetworkManager
+    # lines and the systemd lines about NetworkManager.service ("Stopped NetworkManager.service").
+    MATCHES_MAIN = ["_COMM=pppd", "+", "_SYSTEMD_UNIT=NetworkManager.service", "+", "UNIT=NetworkManager.service"]
+    # Suspend / wake and the boot line of the kernel journal.
+    MATCHES_KERNEL = ["_TRANSPORT=kernel", "--grep", "PM: suspend (entry|exit)|^Linux version "]
+
+    def __init__(self, tray):
+        super().__init__(tray, "VPN drops")
+        self.name = None            # profile of the last load
+        self.lines = []             # journal lines of the first query while the second one runs
+        self.events = []            # result of vpn_events() for the last load
+        self.summary = None
+        self.sort_state = (self.COLUMN_SORT_IDS[0], Gtk.SortType.DESCENDING)  # newest first by default
+        self.sorted_model = None
+
+        for i, title in enumerate(self.COLUMNS):
+            col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i, weight=5)
+            col.set_resizable(True)
+            col.set_sort_column_id(self.COLUMN_SORT_IDS[i])
+            self.view.append_column(col)
+
+        self.render()
+        self.show_all()
+        self.reload()
+
+    # --- loading -------------------------------------------------------------
+
+    def reload(self):
+        if self.closed or self.loading:
+            return
+        name = self.tray.vpn_name()
+        if not name:
+            self.name = None
+            self.events, self.summary = [], None
+            self.render()
+            self.status.set_text("No VPN profile selected")
+            return
+        self.name = name
+        self.set_loading(True)
+        self.status.set_text("Loading…")
+        argv = ["journalctl", "-q", "-o", "short-unix", "--no-pager", *self.period_args(), *self.MATCHES_MAIN]
+        self.proc = run_async(argv, self.on_main_loaded, want_stdout=True)
+
+    def fail(self, stderr, stdout):
+        """Show a failed query (the callers treat a failure without error text and output as an empty
+        result: journalctl exits with 1 when --grep matches nothing)."""
+        stderr = (stderr or "").strip()
+        log("journalctl: %s" % stderr)
+        self.set_loading(False)
+        self.events, self.summary = [], None
+        self.render()
+        self.status.set_text("Failed to read the journal: %s" % (stderr[:200] or "unexpected exit status"))
+
+    def on_main_loaded(self, ok, stderr, stdout):
+        self.proc = None
+        if self.closed:
+            return
+        if not ok and (stderr.strip() or stdout.strip()):
+            self.fail(stderr, stdout)
+            return
+        self.lines = stdout.splitlines()
+        argv = ["journalctl", "-q", "-o", "short-unix", "--no-pager", *self.period_args(), *self.MATCHES_KERNEL]
+        self.proc = run_async(argv, self.on_kernel_loaded, want_stdout=True)
+
+    def on_kernel_loaded(self, ok, stderr, stdout):
+        self.proc = None
+        if self.closed:
+            return
+        if not ok and (stderr.strip() or stdout.strip()):
+            self.fail(stderr, stdout)
+            return
+        lines = self.lines + stdout.splitlines()
+        self.lines = []
+        self.set_loading(False)
+        self.events, self.summary = vpn_events(lines, self.name, time.time(), self.tray.vpn_activated())
+        self.render()
+        s = self.summary
+        if s["drops"] == 0:
+            self.status.set_text("No VPN drops in this period")
+        else:
+            self.status.set_text("%d %s (server silent: %d) · total time without VPN: %s · longest: %s" % (
+                s["drops"], "drop" if s["drops"] == 1 else "drops", s["lcp"],
+                fmt_duration(s["downtime_total"]), fmt_duration(s["downtime_longest"])))
+
+    # --- table ---------------------------------------------------------------
+
+    def render(self):
+        """Fill the table from self.events."""
+        if self.sorted_model is not None:
+            col, order = self.sorted_model.get_sort_column_id()  # (None, None) while unsorted
+            if col is not None and col >= 0:
+                self.sort_state = (col, order)
+        store = Gtk.ListStore(str, str, str, str, float, int, float)
+        for ev in self.events:
+            drop = ev["kind"] == "Drop"
+            downtime, key = "", -1.0
+            if drop and ev.get("opens_gap"):  # only the drop that started an outage has a downtime
+                if ev["downtime"] is None:
+                    downtime, key = "ongoing", self.ONGOING_SORT
+                else:
+                    downtime, key = fmt_duration(ev["downtime"]), float(ev["downtime"])
+            store.append([fmt_time(ev["time"]), ev["kind"], ev["detail"], downtime, ev["time"],
+                          self.BOLD if drop else self.NORMAL, key])
+        self.sorted_model = Gtk.TreeModelSort(model=store)
+        self.sorted_model.set_sort_column_id(*self.sort_state)
+        self.view.set_model(self.sorted_model)
 
 
 def acquire_lock():
