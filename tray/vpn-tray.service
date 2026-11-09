@@ -1,5 +1,5 @@
 [Unit]
-Description=VPN-L2TP tray indicator
+Description=VPN tray indicator
 After=graphical-session.target
 PartOf=graphical-session.target
 

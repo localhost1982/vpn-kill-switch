@@ -27,24 +27,27 @@ from gi.repository import Gtk, NM, AyatanaAppIndicator3
     exit 1
 fi
 
-# 2. Passwordless access: the kill switch counter and unit management from the settings window.
-if ! sudo -n nft list chain inet killswitch output >/dev/null 2>&1; then
-    echo "Warning: sudo -n nft list chain inet killswitch output fails." >&2
-    echo "The tray icon will work but will show \"counter unavailable\" instead of the counter." >&2
-    echo "To enable the counter run: sudo visudo -f /etc/sudoers.d/vpn-stats" >&2
-    echo "and add the line:" >&2
-    echo "  $USER ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch output" >&2
-    echo "(if the kill switch is not installed yet, run ./install.sh first)" >&2
-fi
+# 2. Passwordless access: unit management and the VPN profile switch from the settings window
+#    (needed by the tray), and reading the nftables counter (needed only by vpn-stats.sh;
+#    the tray counts the dropped packets logged in the journal and needs no sudo for that).
+ok_counter=1; ok_unit=1; ok_helper=1
+sudo -n nft list chain inet killswitch output >/dev/null 2>&1 || ok_counter=0
+{ sudo -n -l /usr/bin/systemctl enable --now vpn-killswitch.service >/dev/null 2>&1 \
+    && sudo -n -l /usr/bin/systemctl disable --now vpn-killswitch.service >/dev/null 2>&1; } || ok_unit=0
+sudo -n -l /usr/local/sbin/vpn-killswitch-server >/dev/null 2>&1 || ok_helper=0
 
-# The toggle in the "Settings…" window runs systemctl enable/disable --now via sudo -n.
-if ! sudo -n -l /usr/bin/systemctl enable --now vpn-killswitch.service >/dev/null 2>&1 \
-    || ! sudo -n -l /usr/bin/systemctl disable --now vpn-killswitch.service >/dev/null 2>&1; then
-    echo "Warning: the Kill switch toggle in the Settings… window will not be able to enable or disable the unit." >&2
-    echo "To make it work run: sudo visudo -f /etc/sudoers.d/vpn-stats" >&2
-    echo "and add these two lines:" >&2
+if (( !ok_counter || !ok_unit || !ok_helper )); then
+    echo "Warning: some passwordless sudo permissions are missing:" >&2
+    (( ok_counter )) || echo "  - without the nft permission vpn-stats.sh shows \"n/a (sudo required)\" in the \"Blocked by kill switch, packets\" row (the tray does not need it);" >&2
+    (( ok_unit )) || echo "  - without the systemctl permissions the Kill switch toggle in Settings… cannot enable or disable the unit;" >&2
+    (( ok_helper )) || echo "  - without the vpn-killswitch-server permission the VPN connection cannot be changed in Settings…" >&2
+    echo "To fix this run: sudo visudo -f /etc/sudoers.d/vpn-stats" >&2
+    echo "and add these lines:" >&2
+    echo "  $USER ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch output" >&2
     echo "  $USER ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now vpn-killswitch.service" >&2
     echo "  $USER ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now vpn-killswitch.service" >&2
+    echo "  $USER ALL=(root) NOPASSWD: /usr/local/sbin/vpn-killswitch-server *" >&2
+    echo "(if the kill switch is not installed yet, run ./install.sh first)" >&2
 fi
 
 # 3. The unit with the script path substituted in.

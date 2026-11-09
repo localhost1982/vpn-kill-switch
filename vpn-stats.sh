@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# VPN-L2TP drop and internet-loss statistics for the last N hours.
+# VPN drop and internet-loss statistics for the last N hours.
+# The VPN profile comes from the tray Settings file (or --vpn NAME).
 # Data source: the systemd journal (journalctl). Output: Markdown tables.
-# Usage: ./vpn-stats.sh [hours] [--events]   (details: ./vpn-stats.sh --help)
+# Usage: ./vpn-stats.sh [hours] [--events] [--vpn NAME]   (details: ./vpn-stats.sh --help)
 
 set -euo pipefail
 
 # The decimal point in awk output must not depend on the locale.
 export LC_NUMERIC=C
 
-VPN_NAME="VPN-L2TP"
 DEFAULT_HOURS=1
+SETTINGS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/vpn-killswitch/settings.conf"
 
 # --- Journal line patterns (the part after "unit[pid]: ") -------------------
 # The same set is used both in grep (counting) and in awk (via ENVIRON).
-export RE_START="vpn\\[[^]]*\"VPN-L2TP\"\\]: starting l2tp"
-export RE_UP="policy: set 'VPN-L2TP' \\(ppp[0-9]+\\) as default for IPv4"
-export RE_FAIL="vpn\\[[^]]*\"VPN-L2TP\"\\]: failed to connect"
+# RE_START, RE_UP and RE_FAIL depend on the VPN profile name and are set by
+# build_name_patterns() once the name is known.
 export RE_NOAGENT="secrets: failed to request VPN secrets"
 export RE_LCP="pppd\\[[0-9]+\\]: No response to [0-9]+ echo-requests"
 export RE_TERM="pppd\\[[0-9]+\\]: Terminating on signal"
@@ -30,16 +30,24 @@ export RE_HELLO="message=recv message_type=avpMsgTypeHello"
 
 usage() {
     cat <<'USAGE'
-Usage: vpn-stats.sh [hours] [--events] [-h|--help]
+Usage: vpn-stats.sh [hours] [--events] [--vpn NAME] [-h|--help]
 
-VPN-L2TP drop and internet-loss statistics for the last N hours
+VPN drop and internet-loss statistics for the last N hours
 (Markdown tables, data source: the systemd journal).
+
+The VPN profile is the one selected in the tray Settings window, stored in
+${XDG_CONFIG_HOME:-~/.config}/vpn-killswitch/settings.conf ([vpn] uuid = ...).
+Use --vpn NAME to look at another profile instead (e.g. its history).
+Drop causes (LCP, on command, other) are detected for pppd-based profiles
+(L2TP, PPTP); for other VPN types only connection events are counted.
 
   hours      period in hours, default 1. Both a decimal point and a decimal comma
              are accepted (1.5, 1,5). Step is 0.5 h: the value is rounded
              half up to the nearest half hour (0.7 -> 0.5, 0.75 -> 1, 1.2 -> 1,
              1.3 -> 1.5). If the result after rounding is 0 or the value is not
              a number, 1 h is used.
+  --vpn NAME use the NetworkManager VPN profile NAME instead of the one from the
+             settings file
   --events   after the tables, print a chronology of events (connections, drops,
              suspends, NetworkManager restarts, boots, connection failures)
   -h, --help show this help
@@ -49,6 +57,7 @@ Examples:
   ./vpn-stats.sh 0.5        # the last half hour
   ./vpn-stats.sh 1,5        # an hour and a half
   ./vpn-stats.sh 3 --events # three hours with the chronology
+  ./vpn-stats.sh 6 --vpn "Work VPN"  # another profile
 
 sudo is not needed, except for the row with the kill switch blocked-packet counter:
 without passwordless sudo it will show "n/a (sudo required)". The script never asks for a password.
@@ -105,11 +114,47 @@ fmt_duration() {
 fmt_time() { date -d "@$1" +%H:%M:%S; }
 fmt_datetime() { date -d "@$1" '+%Y-%m-%d %H:%M'; }
 
-# Whether the VPN is connected right now (0 = yes).
+# Determine VPN_NAME and VPN_UUID: --vpn NAME (VPN_NAME_ARG) overrides the settings file.
+resolve_vpn() {
+    VPN_NAME=""
+    VPN_UUID=""
+    if [[ -n $VPN_NAME_ARG ]]; then
+        VPN_NAME=$VPN_NAME_ARG
+        VPN_UUID=$(nmcli -g connection.uuid connection show "$VPN_NAME" 2>/dev/null | head -n1 || true)
+    else
+        if [[ -r $SETTINGS_FILE ]]; then
+            VPN_UUID=$(sed -n 's/^[[:space:]]*uuid[[:space:]]*=[[:space:]]*//p' "$SETTINGS_FILE" | head -n1 || true)
+            VPN_UUID=${VPN_UUID%%[[:space:]]*}
+        fi
+        if [[ -n $VPN_UUID ]]; then
+            VPN_NAME=$(nmcli -g connection.id connection show "$VPN_UUID" 2>/dev/null | head -n1 || true)
+        fi
+    fi
+    if [[ -z $VPN_NAME ]]; then
+        echo "No VPN profile selected. Choose one in the tray Settings window or pass --vpn NAME." >&2
+        exit 1
+    fi
+}
+
+# Journal patterns that contain the profile name (escaped for ERE).
+build_name_patterns() {
+    local name_re
+    name_re=$(printf '%s' "$VPN_NAME" | sed 's/[][\.*^$+?(){}|/\\]/\\&/g')
+    export RE_START="vpn\\[[^]]*\"${name_re}\"\\]: starting "
+    export RE_UP="policy: set '${name_re}' \\([a-z0-9]+\\) as default for IPv4"
+    export RE_FAIL="vpn\\[[^]]*\"${name_re}\"\\]: failed to connect"
+}
+
+# Whether the VPN is connected right now (0 = yes): by UUID when known, else by name.
 vpn_active() {
-    local names
-    names=$(nmcli -t -f NAME connection show --active 2>/dev/null || true)
-    grep -Fxq -- "$VPN_NAME" <<<"$names"
+    local list
+    if [[ -n $VPN_UUID ]]; then
+        list=$(nmcli -t -f UUID connection show --active 2>/dev/null || true)
+        grep -Fxq -- "$VPN_UUID" <<<"$list"
+    else
+        list=$(nmcli -t -f NAME connection show --active 2>/dev/null || true)
+        grep -Fxq -- "$VPN_NAME" <<<"$list"
+    fi
 }
 
 # systemd unit state -> "active" / "inactive" / "unavailable" (if there is no answer).
@@ -248,6 +293,7 @@ AWK
 
 # --- Main code ----------------------------------------------------------------
 SHOW_EVENTS=0
+VPN_NAME_ARG=""
 ARG_HOURS=""
 HAVE_ARG=0
 
@@ -255,6 +301,14 @@ while (( $# > 0 )); do
     case $1 in
         -h|--help) usage; exit 0 ;;
         --events)  SHOW_EVENTS=1 ;;
+        --vpn)
+            if (( $# < 2 )) || [[ -z $2 ]]; then
+                echo "Option --vpn requires a profile name" >&2
+                usage >&2
+                exit 2
+            fi
+            VPN_NAME_ARG=$2
+            shift ;;
         -[0-9.,]*|[0-9.,]*|[!-]*)
             # Negative numbers and any non-flag are treated as the "hours" value,
             # so that "-1" gets a note rather than an error.
@@ -279,6 +333,9 @@ else
     HALFHOURS=$((DEFAULT_HOURS * 2))
 fi
 MINUTES=$((HALFHOURS * 30))
+
+resolve_vpn
+build_name_patterns
 
 JOURNAL=$(mktemp)
 trap 'rm -f "$JOURNAL"' EXIT
@@ -354,7 +411,7 @@ echo "| Metric | Value |"
 echo "|---|---:|"
 echo "| VPN drops, total | $TOTAL |"
 echo "|   • server stopped responding (LCP) | $LCP |"
-echo "|   • on command: sleep, nmcli down, watchdog | $SIGNAL |"
+echo "|   • on command: sleep, nmcli down | $SIGNAL |"
 echo "|   • other | $OTHER |"
 echo "| VPN connection attempts | $STARTS |"
 echo "| Successful connections | $OKS |"
@@ -378,7 +435,7 @@ echo "| Metric | Value |"
 echo "|---|---:|"
 echo "| $VPN_NAME | $VPN_NOW |"
 echo "| Kill switch (vpn-killswitch.service) | $(unit_state systemctl is-active vpn-killswitch.service) |"
-echo "| Watchdog (old-vpn-watchdog.service) | $(unit_state systemctl --user is-active old-vpn-watchdog.service) |"
+echo "| Watchdog (vpn-watchdog.service) | $(unit_state systemctl --user is-active vpn-watchdog.service) |"
 echo "| Blocked by kill switch, packets | $(killswitch_drops) |"
 
 if (( SHOW_EVENTS )); then

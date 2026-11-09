@@ -1,34 +1,45 @@
-# VPN kill switch for VPN-L2TP
+# VPN kill switch for NetworkManager VPN profiles
 
-Blocks internet access that bypasses the VPN. While the VPN-L2TP tunnel is down or
+Blocks internet access that bypasses the VPN. While the VPN tunnel is down or
 not yet established, the only traffic that leaves the machine is what the VPN itself
 needs to come up, plus local-network traffic. Everything else is dropped.
 
-Built for Ubuntu with NetworkManager and the nm-l2tp plugin (strongSwan + kl2tpd + pppd).
-Implementation: a single nftables table and a systemd unit that loads it at boot.
+Works with any NetworkManager VPN profile: L2TP/IPsec, PPTP, OpenVPN, WireGuard, IKEv2
+and so on. The profile is not hard-coded: you choose it in the Settings window of the
+tray icon, and that choice drives the tray, the watchdog, the statistics script and the
+VPN server addresses the kill switch lets through.
+
+Built for Ubuntu with NetworkManager. Implementation: a single nftables table, a systemd
+unit that loads it at boot and a small root helper that keeps the VPN server addresses
+up to date.
 
 ## Contents
 
 | File | Purpose |
 |---|---|
-| `killswitch.nft` | nftables rules. Installed to `/etc/nftables.d/killswitch.nft`. |
+| `killswitch.nft` | Generic nftables rules. Installed to `/etc/nftables.d/killswitch.nft`. |
 | `vpn-killswitch.service` | systemd unit that loads the rules before the network comes up. Installed to `/etc/systemd/system/`. |
-| `install.sh` | Installation and enabling. |
+| `vpn-killswitch-server.sh` | Root helper that resolves the VPN server host names and writes the allowed server addresses. Installed to `/usr/local/sbin/vpn-killswitch-server`. |
+| `install.sh` | Installation and enabling. `--server HOST` sets the VPN server on the first install. |
 | `uninstall.sh` | Disabling and complete removal. |
-| `vpn-stats.sh` | Statistics of VPN-L2TP drops and internet outages for the last N hours. |
-| `tray/vpn-tray.py` | VPN icon in the GNOME top bar with a statistics menu. |
+| `vpn-stats.sh` | Statistics of VPN drops and internet outages of the selected profile for the last N hours. |
+| `tray/vpn-tray.py` | VPN icon in the GNOME top bar with a statistics menu and the Settings window (VPN profile, kill switch). |
 | `tray/vpn-tray.service` | `systemd --user` unit that starts the icon after you log in to the session. |
-| `tray/install-tray.sh` | Dependency check, installation and enabling of the icon unit. |
+| `tray/install-tray.sh` | Dependency check, sudoers check, installation and enabling of the icon unit. |
 | `tray/uninstall-tray.sh` | Stops and removes the icon unit. |
+| `watchdog/vpn-watchdog.sh` | Keeps the selected VPN profile connected: checks every 3 s and brings it up if it is down. |
+| `watchdog/vpn-watchdog.service` | `systemd --user` unit that runs the watchdog. |
+| `watchdog/install-watchdog.sh` | Installation and enabling of the watchdog unit. |
+| `watchdog/uninstall-watchdog.sh` | Stops and removes the watchdog unit. |
 
 ## Why you need it
 
-VPN-L2TP has two unpleasant failure modes.
+A VPN has two unpleasant failure modes.
 
-1. **The tunnel "hangs".** The `ppp1` interface is alive and the default route points
-   into it, but the server is silent. Traffic goes into the void. This is inconvenient,
-   but nothing leaks out.
-2. **The tunnel dies and NetworkManager notices.** It removes `ppp1`, and the default
+1. **The tunnel "hangs".** The tunnel interface (for example `ppp1`) is alive and the
+   default route points into it, but the server is silent. Traffic goes into the void.
+   This is inconvenient, but nothing leaks out.
+2. **The tunnel dies and NetworkManager notices.** It removes the tunnel interface, and the default
    route falls back to Wi-Fi. From then on all traffic, DNS included, goes straight
    to the internet until the VPN is reconnected by hand. This is the leak.
 
@@ -37,34 +48,82 @@ to Wi-Fi, the rules let nothing out except VPN service packets.
 
 ## How it works
 
-The rules live in a separate table, `inet killswitch`, with two chains.
+The rules live in a separate table, `inet killswitch`, with two chains. They are generic:
+nothing in them depends on a particular VPN profile or protocol.
 
 **The `output` chain** (the laptop's own traffic). The following pass without restrictions:
 
 - `lo`;
-- `ppp*`, that is, the VPN-L2TP tunnel;
+- the tunnel interfaces `ppp*`, `tun*`, `tap*` and `wg*` (L2TP/IPsec, PPTP, OpenVPN,
+  WireGuard and so on);
 - `docker0`, `br-*`, `veth*`, that is, Docker.
 
 For any other interface (Wi-Fi, Ethernet, USB modem, anything that appears later)
 only the following is allowed:
 
 - DHCP (UDP 68 → 67);
-- UDP 500 and 4500 to the VPN server address (IKE and IPsec NAT-T);
-- UDP 1701 to the VPN server address. This is L2TP itself: netfilter sees it in `output`
-  before the kernel encrypts it into ESP, so without this rule L2TP is dropped even
-  though IPsec comes up;
+- any traffic to the VPN server addresses (the `vpn_server` set): IKE/ESP, L2TP, PPTP/GRE,
+  OpenVPN, WireGuard. This is a single rule, `ip daddr @vpn_server accept`, so no
+  protocol-specific ports are needed. The set holds IPv4 addresses only;
 - local networks: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `224.0.0.0/4`;
 - IPv6 link-local (`fe80::/10`, `ff00::/8`), so that NDP works.
 
 Everything else is dropped by the `counter drop` rule. Its counter shows
 how many packets have been blocked.
 
+Before each `drop` there is a `log` rule: `limit rate 10/second burst 20 packets log prefix "KS-DROP: "
+flags skuid level info`. It writes the dropped packets to the kernel log (and so to the journal),
+at most 10 lines per second (a burst of 20), so a flood of blocked packets cannot fill the journal.
+The counter is not limited and stays exact. For the `output` chain the line also carries the UID of
+the sending user (`flags skuid`). To see what was blocked, use the tray's "Dropped packets" window
+(see "Tray icon") or:
+
+```bash
+journalctl -k --grep KS-DROP
+```
+
 **The `forward` chain** (traffic the laptop forwards, i.e. Docker containers).
-Containers may go out through `ppp*`, talk to each other over the Docker bridges and reach
-the local network. They cannot reach the internet directly, bypassing the VPN.
+Containers may go out through the tunnel interfaces, talk to each other over the Docker bridges and reach
+the local network. They cannot reach the internet directly, bypassing the VPN. Its `drop` is preceded by
+the same kind of rate-limited `log` rule, with the prefix `KS-DROP-FWD: ` (no UID: the sender is a container).
 
 The table does not depend on whether NetworkManager noticed the VPN failure. The rules
 are static and always in effect.
+
+### Where the VPN server addresses come from
+
+`killswitch.nft` starts with `include "/etc/nftables.d/killswitch-server.nft"`, a generated
+file with a single line of the form `define vpn_servers = { 203.0.113.10 }`, and builds the
+`vpn_server` set from `$vpn_servers`. That file must not be edited by hand. It is written by
+the helper `/usr/local/sbin/vpn-killswitch-server` (installed from `vpn-killswitch-server.sh`),
+which runs as root:
+
+```
+vpn-killswitch-server set HOST [HOST...]   resolve the VPN server host(s) and update the kill switch
+vpn-killswitch-server refresh              re-resolve the saved hosts and update the kill switch
+vpn-killswitch-server show                 show the saved hosts and the current define line
+```
+
+- `HOST` is a host name or an IPv4 address. The hosts are validated, all of them are
+  resolved first, and nothing is written if any host cannot be resolved.
+- The saved hosts (one per line) are kept in `/etc/vpn-killswitch/servers`, the resolved
+  addresses in `/etc/nftables.d/killswitch-server.nft`. `set` replaces the whole list.
+- The new rules are checked with `nft -c`. If nft rejects them, the previous files are
+  restored. If `vpn-killswitch.service` is active, it is reloaded; otherwise the helper
+  prints `Kill switch is not active; files updated, rules will apply on next start.`
+- Exit codes: 0 ok, 1 general error, 2 invalid usage or host, 3 cannot resolve a host,
+  4 nft rejected the new rules, 5 the service reload failed.
+- For testing without root: `VKS_PREFIX=/some/dir` is prepended to all `/etc` paths and
+  `VKS_DRY_RUN=1` skips the root check, `nft -c` and `systemctl`.
+
+The server addresses are updated in two ways:
+
+- on the first install, `./install.sh --server <vpn-gateway-host>` calls `set`;
+- when you pick another VPN profile and press `Save` in the tray Settings window, the tray
+  calls `set` with the server hosts of that profile (see "Settings").
+
+Host names are resolved when `set` runs. If the server's IP address changes later,
+run `sudo vpn-killswitch-server refresh` (see "Changing the rules").
 
 ### Why not `nftables.service`
 
@@ -78,33 +137,112 @@ the `inet killswitch` table is recreated, and all other tables stay as they were
 
 - nftables (`nft`), usually already installed in Ubuntu;
 - systemd;
-- a VPN through NetworkManager with a `ppp*` interface (nm-l2tp, nm-pptp). For OpenVPN
-  or WireGuard, replace `ppp*` with `tun*` or the name of the WireGuard interface;
+- a VPN through NetworkManager with a tunnel interface named `ppp*`, `tun*`, `tap*` or `wg*`
+  (nm-l2tp, nm-pptp, OpenVPN, WireGuard, strongSwan IKEv2 with a virtual interface and so on).
+  If your VPN uses another interface name, add it to the `oifname` lists in both chains of
+  `killswitch.nft`;
 - ufw is disabled or does not interfere (the kill switch table works independently of it).
 
 ## Installation
+
+### 1. The kill switch
+
+The first install needs the VPN gateway, that is, the host name or IPv4 address that the
+VPN profile connects to (the "Gateway" or "Remote" field of the profile, or the endpoint of a
+WireGuard peer). It has to stay reachable outside the tunnel:
+
+```bash
+./install.sh --server <vpn-gateway-host>
+```
+
+The option is repeatable (`--server HOST --server HOST`). The script re-runs itself through
+`sudo`, copies the rules, the unit and the helper, resolves the server and checks the rules
+syntax, enables the service and shows the loaded table. Without `--server` the first install
+stops with `No VPN server configured yet. Run: ./install.sh --server <vpn-gateway-host>`.
+
+To re-install (for example after editing `killswitch.nft`), run it without the option:
 
 ```bash
 ./install.sh
 ```
 
-The script re-runs itself through `sudo`, checks the rules syntax, copies
-the files, enables the service and shows the loaded table.
+The saved server list is kept. The VPN profile itself is chosen later in the tray Settings,
+and picking a profile there replaces the server list with the servers of that profile.
 
-Before the first run, check the VPN server address in `killswitch.nft`:
-
-```
-set vpn_server {
-    type ipv4_addr
-    elements = { 203.0.113.10 }
-}
-```
-
-To find the current address:
+To find the current address of a host:
 
 ```bash
-getent hosts vpn.example.com
+getent hosts <vpn-gateway-host>
 ```
+
+### 2. The tray icon
+
+```bash
+./tray/install-tray.sh
+```
+
+See "Tray icon" below for the requirements. Then open `Settings…` in the tray menu and
+choose the VPN connection.
+
+### 3. The watchdog
+
+```bash
+./watchdog/install-watchdog.sh
+```
+
+See "Watchdog" below. The script warns if an older fixed-profile watchdog is still running:
+
+```
+An older watchdog old-vpn-watchdog.service is enabled; it keeps reconnecting a fixed profile. Disable it: systemctl --user disable --now old-vpn-watchdog.service
+```
+
+Two watchdogs would fight each other, so disable the older one (such as a custom
+`old-vpn-watchdog.service`) with the command from the hint.
+
+### 4. The sudoers rules
+
+The tray runs a few commands through `sudo -n` (it must never ask for a password), and
+`vpn-stats.sh` reads the nftables counter through `sudo -n` too. Create one sudoers file with all
+four rules (replace `youruser` with your user name):
+
+```bash
+sudo visudo -f /etc/sudoers.d/vpn-stats
+```
+
+```
+youruser ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch output
+youruser ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now vpn-killswitch.service
+youruser ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now vpn-killswitch.service
+youruser ALL=(root) NOPASSWD: /usr/local/sbin/vpn-killswitch-server *
+```
+
+What each line enables:
+
+1. `nft list chain inet killswitch output`: reading the exact nftables blocked-packet counter. Only
+   `vpn-stats.sh` needs it (the "Blocked by kill switch, packets" row); the tray does not use it:
+   the `Kill switch: …` menu line counts the packets logged in the kernel journal. The rule allows
+   exactly one command. Without it `vpn-stats.sh` shows `n/a (sudo required)` in that row and
+   everything else works.
+2. `systemctl enable --now vpn-killswitch.service`: turning the kill switch on with the toggle
+   in Settings.
+3. `systemctl disable --now vpn-killswitch.service`: turning it off with the toggle.
+4. `vpn-killswitch-server *`: changing the VPN profile in Settings (the tray runs the helper's
+   `set` command). It also lets you run `sudo vpn-killswitch-server refresh` without a password.
+   The helper validates every host argument, but note that this line lets the user change which
+   servers are reachable outside the tunnel.
+
+`install-tray.sh` checks these permissions and prints a warning with the missing lines.
+Without lines 2-3 or 4, `Save` in Settings does not work (see "Settings").
+
+To also read the `forward` chain (dropped traffic of Docker containers), add one more
+line to the same file:
+
+```
+youruser ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch forward
+```
+
+Currently the icon does not read this chain; the line is only needed for future
+use or for manual queries.
 
 ## Verification
 
@@ -122,12 +260,18 @@ ping -c 2 192.168.100.1
 
 The router should respond (the local network is allowed).
 
-Then connect VPN-L2TP and repeat the `curl`. It should work.
+Then connect the VPN and repeat the `curl`. It should work.
 
 To view the rules and the blocked-packet counters:
 
 ```bash
 sudo nft list table inet killswitch
+```
+
+To see which VPN servers are allowed:
+
+```bash
+sudo vpn-killswitch-server show
 ```
 
 Service status:
@@ -142,10 +286,26 @@ systemctl status vpn-killswitch.service
 ./uninstall.sh
 ```
 
-Stops the service, deletes the table and erases the files from `/etc`. Traffic
+Stops the service, deletes the table and erases the files: the rules and the unit, the helper
+`/usr/local/sbin/vpn-killswitch-server`, the generated `/etc/nftables.d/killswitch-server.nft`
+and the folder `/etc/vpn-killswitch/` with the saved servers. Traffic
 immediately starts flowing without restrictions.
 
-To disable it temporarily without removing it:
+The tray and the watchdog are user-level and are removed separately, as a regular user:
+
+```bash
+./tray/uninstall-tray.sh
+./watchdog/uninstall-watchdog.sh
+```
+
+None of the scripts touches the settings file `~/.config/vpn-killswitch/settings.conf`
+(the selected VPN profile) or your sudoers file. To remove the settings:
+
+```bash
+rm -r ~/.config/vpn-killswitch
+```
+
+To disable the kill switch temporarily without removing it:
 
 ```bash
 sudo systemctl stop vpn-killswitch.service
@@ -166,15 +326,19 @@ Or edit `/etc/nftables.d/killswitch.nft` directly and reload:
 sudo systemctl reload vpn-killswitch.service
 ```
 
+Do not edit `/etc/nftables.d/killswitch-server.nft`: it is generated by the helper.
+
 Typical changes:
 
-- **The VPN server IP changed.** Update `elements` in the `vpn_server` set. You can
-  list several addresses separated by commas.
-- **A different VPN type.** Replace `oifname "ppp*"` with the right interface in both
-  chains, and ports 500 and 4500 with your VPN's port (for example, UDP 1194 for OpenVPN).
+- **The VPN server IP changed.** Run `sudo vpn-killswitch-server refresh`: it re-resolves the
+  saved hosts and reloads the rules. To change the servers themselves, run
+  `sudo vpn-killswitch-server set HOST [HOST...]` (or pick the profile in the tray Settings).
+  Several hosts are allowed.
+- **A tunnel interface with another name.** Add it to the `oifname { "ppp*", "tun*", "tap*", "wg*" }`
+  lists in both chains. No protocol-specific ports are needed: all traffic to the server is allowed.
 - **Disallow the local network.** Remove the `ip daddr @lan accept` line. You will then
   need DNS for the VPN server name: add the line
-  `203.0.113.10 vpn.example.com` to `/etc/hosts`. The router, printers and local
+  `<server IP> <vpn-gateway-host>` to `/etc/hosts`. The router, printers and local
   development will become unreachable without the VPN.
 - **Allow something specific to bypass the VPN**, for example NTP: add a line such as
   `udp dport 123 accept` before `counter drop`.
@@ -193,6 +357,9 @@ Typical changes:
 
   Side effect: NetworkManager will stop detecting captive portals, but
   with the kill switch they would not open anyway.
+- **The kernel journal grows while the VPN is down.** Every dropped packet is logged, but the `log`
+  rules are rate-limited (10/s, burst 20), so the journal grows by at most 10 lines per second while
+  the VPN is down, and not at all while traffic flows through the tunnel.
 - **DNS while the VPN is off.** The local network is allowed, so application queries
   go to the local resolver (usually the router). This is needed to resolve the VPN
   server name before connecting. If such a leak is unacceptable, see "Disallow the local network".
@@ -200,31 +367,43 @@ Typical changes:
   network and will be blocked. Stop the service while you log in, then start it again.
 - **A network whose resolver is not in a private range.** The VPN server name will not resolve
   and the VPN will not connect. Solution: an entry in `/etc/hosts`.
-- **VPN autoconnect.** The kill switch does not reconnect the VPN by itself. To make VPN-L2TP
-  come up automatically after login and after sleep:
+- **VPN autoconnect.** The kill switch does not reconnect the VPN by itself. To make the VPN
+  come up automatically after login and after sleep, either install the watchdog (see "Watchdog"),
+  which follows the profile selected in Settings, or set autoconnect on the profile:
 
   ```bash
-  nmcli connection modify VPN-L2TP connection.autoconnect yes
+  nmcli connection modify "My VPN" connection.autoconnect yes
   ```
 
 - **Dead tunnel detection.** By default pppd does not check whether the link is alive,
-  and a hung VPN stays hung forever. To make NetworkManager drop it on its own after about
-  half a minute:
+  and a hung VPN stays hung forever. For pppd-based profiles (L2TP, PPTP), to make NetworkManager
+  drop it on its own after about half a minute:
 
   ```bash
-  nmcli connection modify VPN-L2TP +vpn.data lcp-echo-interval=10 +vpn.data lcp-echo-failure=3
+  nmcli connection modify "My VPN" +vpn.data lcp-echo-interval=10 +vpn.data lcp-echo-failure=3
   ```
 
-  Together with autoconnect this gives automatic VPN recovery, and the kill switch
+  Together with autoconnect or the watchdog this gives automatic VPN recovery, and the kill switch
   covers the window between the drop and the recovery.
 
 ## Drop statistics
 
 ```bash
-./vpn-stats.sh [hours] [--events]
+./vpn-stats.sh [hours] [--events] [--vpn NAME]
 ```
 
 The script reads the systemd journal for the last N hours and prints two Markdown tables.
+
+**The profile** is the one selected in the tray Settings, read from
+`~/.config/vpn-killswitch/settings.conf` (`[vpn] uuid = ...`; `$XDG_CONFIG_HOME` is respected).
+`--vpn NAME` takes another NetworkManager profile by its name instead, for example to look at its
+history. If neither is available, the script exits with
+`No VPN profile selected. Choose one in the tray Settings window or pass --vpn NAME.`
+
+**Drop causes are detected from pppd.** The causes below (LCP, on command, other) and the drop
+counts come from pppd messages, so they exist only for pppd-based profiles (L2TP, PPTP). For other
+VPN types (OpenVPN, WireGuard, IKEv2 and so on) only the connection events are counted: attempts,
+successful and failed connections.
 
 **"Statistics"** is built from journal events:
 
@@ -232,18 +411,19 @@ The script reads the systemd journal for the last N hours and prints two Markdow
 |---|---|
 | VPN drops, total | pppd `Connection terminated`. If there are fewer of them than the causes below, the sum of the causes is used. |
 | server stopped responding (LCP) | `No response to 3 echo-requests`. |
-| on command: sleep, nmcli down, watchdog | `Terminating on signal`. NetworkManager sends it on `nmcli connection down`, on suspend and when the watchdog is stopped. |
+| on command: sleep, nmcli down | `Terminating on signal`. NetworkManager sends it on `nmcli connection down` and on suspend. |
 | other | the remainder: drops that have neither of the two causes above. |
-| VPN connection attempts / Successful connections / Failed connections (timeout) | `starting l2tp`, `policy: set 'VPN-L2TP' ... as default`, `failed to connect`. |
+| VPN connection attempts / Successful connections / Failed connections (timeout) | NetworkManager messages of the selected profile: `starting`, `policy: set '<profile>' ... as default`, `failed to connect`. |
 | Password request errors (no agent) | `failed to request VPN secrets` (no password agent). |
-| Total time without VPN / Longest outage | computed from the order of events: from a drop to the next successful connection. Suspend time is not counted. Nothing is counted before the first VPN event in the window. If VPN-L2TP is not connected right now, an unclosed outage is counted up to the current moment. |
-| Hello from L2TP server | `avpMsgTypeHello` in the kl2tpd debug output, and the time of the last one. |
+| Total time without VPN / Longest outage | computed from the order of events: from a drop to the next successful connection. Suspend time is not counted. Nothing is counted before the first VPN event in the window. If the VPN is not connected right now, an unclosed outage is counted up to the current moment. |
+| Hello from L2TP server | `avpMsgTypeHello` in the kl2tpd debug output, and the time of the last one. Only L2TP profiles produce it. |
 | Wi-Fi: disconnects / Wi-Fi: resets after VPN failure | `state change: activated -> ...` and `secondary-connection-failed` on a `wl*` interface. |
 | Suspends / NetworkManager restarts / System boots | `PM: suspend entry`, `Stopped NetworkManager.service`, `Linux version`. |
 | Last drops | up to five most recent drops with the cause: `LCP`, `sleep`, `command` or `other`. |
 
-**"Now"**: whether VPN-L2TP is connected, the state of `vpn-killswitch.service` and of the watchdog
-`old-vpn-watchdog.service`, and the number of packets dropped by the kill switch.
+**"Now"**: whether the selected profile is connected (the row is named after the profile),
+the state of the kill switch (`Kill switch (vpn-killswitch.service)`), of the watchdog
+(`Watchdog (vpn-watchdog.service)`) and the number of packets dropped by the kill switch.
 
 **The period** is given in hours. The default is 1 hour. Both a decimal point and a decimal comma
 are accepted. The step is half an hour: the value is rounded half up to the nearest 0.5 h
@@ -255,6 +435,7 @@ or the value is not a number, 1 hour is used and an explanatory note is printed 
 ./vpn-stats.sh 0.5        # the last half hour
 ./vpn-stats.sh 1,5        # an hour and a half
 ./vpn-stats.sh 3          # three hours
+./vpn-stats.sh 6 --vpn "My VPN"   # another profile
 ```
 
 The `--events` flag adds a chronology: connections, drops, suspend and wake,
@@ -268,10 +449,15 @@ NetworkManager restarts, boots, connection failures and password request failure
 through `sudo -n nft`. Without passwordless `sudo` it will show `n/a (sudo required)`.
 The script never asks for a password.
 
+That row is the exact nftables counter: it is not rate-limited, but it is reset to 0 on every rules
+load (a reboot, `./install.sh`, a reload of the service). The tray shows a different number: the
+packets logged in the kernel journal since boot (see "Tray icon"). The two may differ.
+
 ## Tray icon
 
 A permanent indicator in the GNOME top bar: the icon shows whether the VPN is alive, and the menu
-collects the statistics that you would otherwise have to open a terminal for.
+collects the statistics that you would otherwise have to open a terminal for. The VPN it shows
+is the profile selected in the Settings window.
 
 ```bash
 ./tray/install-tray.sh
@@ -281,23 +467,32 @@ collects the statistics that you would otherwise have to open a terminal for.
 
 | Icon | When |
 |---|---|
-| `org.gnome.Settings-network-symbolic` | VPN-L2TP is connected (the "Network" icon from GNOME Settings) |
-| `network-wired-acquiring-symbolic` | VPN-L2TP is connecting |
-| `network-wired-disconnected-symbolic` | VPN-L2TP is not connected |
+| `org.gnome.Settings-network-symbolic` | the selected VPN profile is connected (the "Network" icon from GNOME Settings) |
+| `network-wired-acquiring-symbolic` | the profile is connecting |
+| `network-wired-disconnected-symbolic` | the profile is not connected, or no profile is selected |
 
-**Menu** (the first four lines only display data and are refreshed when the menu
-is opened and by timers):
+**Menu** (the lines only display data and are refreshed when the menu is opened and by timers;
+clicking the `Kill switch: …` line opens the "Dropped packets" window, see below):
 
-- `VPN-L2TP: connected 4h 12m` or `VPN-L2TP: disconnected`. The time is counted
-  from the last successful activation of the profile;
+- `My VPN: connected 4h 12m` or `My VPN: disconnected` (`My VPN` stands for the name of the selected
+  profile; while connecting: `My VPN: connecting…`). The time is counted
+  from the last successful activation of the profile. If no profile is selected, the line reads
+  `VPN: not selected`; if the selected profile was deleted from NetworkManager, `VPN: profile not found`;
+  `My VPN: state unknown` means that NetworkManager does not answer;
 - `Uptime: 5h 01m`. System uptime;
 - `Kill switch: active, 0 packets dropped`, `Kill switch: OFF` or
-  `Kill switch: active, counter unavailable`;
+  `Kill switch: active, journal unavailable`. The number is the count of packets logged in the kernel
+  journal since boot (the `KS-DROP` lines), identical to the `Since boot` period of the "Dropped
+  packets" window. A rules reload does not reset it, but it counts only logged packets: the log is
+  rate-limited to 10 lines per second, so during a burst the exact nftables counter (shown by
+  `vpn-stats.sh`) can be higher. Clicking this line opens the "Dropped packets" window (see below);
 - `VPN drops since boot: 1 (server silent: 0)`. The logic is the same as in `vpn-stats.sh`:
   the total is the larger of the number of `Connection terminated` and the sum of the causes, and the
-  number in parentheses is the count of `No response to N echo-requests`;
-- `Reconnect VPN` runs `nmcli connection up VPN-L2TP` in the background;
-- `Settings…` opens the settings window (see "Settings window" below);
+  number in parentheses is the count of `No response to N echo-requests`. These are pppd
+  messages, so for VPN types without pppd the line stays at 0;
+- `Reconnect VPN` runs `nmcli connection up uuid <UUID of the selected profile>` in the background
+  (it is unavailable while no profile is selected);
+- `Settings…` opens the settings window (see "Settings" below);
 - `Quit` closes the icon (the unit is not restarted in that case, see below).
 
 The icon writes durations in short forms: `12s`, `3m 05s`, `1h 02m`,
@@ -308,11 +503,51 @@ and for days `1d 03h`.
 | Indicator | Source | Refresh |
 |---|---|---|
 | VPN state | libnm (`NM.Client`), the active-connections change signal | on event and every 5 s |
-| VPN uptime | `connection.timestamp` of the VPN-L2TP profile | when the menu is opened and every 5 s |
+| VPN uptime | `connection.timestamp` of the selected profile | when the menu is opened and every 5 s |
 | System uptime | `/proc/uptime` | when the menu is opened and every 5 s |
 | Kill switch enabled | `systemctl is-active vpn-killswitch.service` | when the menu is opened and every 60 s |
-| Packets dropped | `sudo -n nft list chain inet killswitch output`, `counter packets` in the line with `drop` | when the menu is opened and every 60 s |
+| Packets dropped | `journalctl -q -o short-unix --no-pager --grep ^KS-DROP -b _TRANSPORT=kernel`, the number of lines (no `sudo`) | when the menu is opened and every 60 s |
 | VPN drops | `journalctl -b -q -o cat _COMM=pppd` | every 60 s |
+| Dropped packets window | `journalctl -q -o short-unix --grep ^KS-DROP _TRANSPORT=kernel` | when the window is opened, on `Refresh` and when the period changes |
+
+### Dropped packets window
+
+A click on the `Kill switch: …` menu line opens the "Dropped packets" window
+in the center of the screen. Choosing it again brings the open window to the front; Escape and `Close`
+close it, and the icon keeps running. It shows which packets the kill switch blocked, taken from the
+`KS-DROP` kernel log lines written by the `log` rules (see "How it works"). The window needs read
+access to the kernel journal (the user must be in the `adm` or `systemd-journal` group).
+
+- **Period**: `Last hour`, `Last 6 hours`, `Last 24 hours`, `This session` (since the tray icon
+  was started) or `Since boot` (the default). The list is
+  reloaded when the period changes. The longer periods read the persistent kernel journal, so they
+  can reach back before the last boot;
+- **Group identical flows** (on by default): one row per combination of protocol, destination
+  (address and port, or ICMP type/code), interface, user and chain, with the number of logged packets
+  and the time of the last one. The columns are `Last seen`, `Count`, `Proto`, `Destination`,
+  `Interface`, `User`, `Host`. With the option off the table lists every logged packet:
+  `Time`, `Proto`, `Source`, `Destination`, `Interface`, `User`, `Flags` (`SYN`, `ACK`, `FIN`, `RST`,
+  `PSH`, `URG`, `DF`), `Chain` (`output` or `forward`), `Host`. The newest rows come first; click a
+  column header to sort by it. Times are `HH:MM:SS` for today and `YYYY-MM-DD HH:MM:SS` otherwise.
+  `User` is the user that sent the packet (the UID from the log line, shown as a name when it has one;
+  empty for forwarded packets and for lines logged without a UID);
+- **Resolve hostnames** (off by default): looks up the host name of every distinct destination address
+  in the background (reverse DNS, about 2 s per address at most) and fills the `Host` column. The window
+  never waits for it; results are cached while the window stays open. Note that this sends reverse DNS
+  queries for the destinations to your resolver. Turning the option off clears the column;
+- **Refresh** reloads the list. The controls are unavailable while it loads.
+
+The line at the bottom reads, for example,
+`27 packets logged in this period · logging is rate-limited to 10/s` (`1 packet` for a single one),
+or `No dropped packets logged in this period`. While the list loads it reads `Loading…`; if the
+journal cannot be read, `Failed to read the journal: …`.
+
+With the `Since boot` period the number in this line is the same as the number in the
+`Kill switch: …` menu line. Keep in mind that both count log lines, and the log is rate-limited to
+10 lines per second, so during a burst the real number of dropped packets can be higher. The exact
+nftables counter (`vpn-stats.sh`, `sudo nft list table inet killswitch`) is not shown in the tray; it
+starts from zero whenever the rules are loaded, while the journal keeps its lines across reloads.
+Packets dropped before the `log` rules were installed are not visible in the journal at all.
 
 ### Requirements
 
@@ -321,8 +556,9 @@ and for days `1d 03h`.
   prints the `sudo apt install ...` command; it does not run `apt` itself);
 - the AppIndicator extension enabled in GNOME Shell (in Ubuntu this is
   `ubuntu-appindicators@ubuntu.com`). Without it the icon will not appear;
-- a NetworkManager profile named `VPN-L2TP`;
-- the kill switch installed (otherwise the line will show `OFF`).
+- at least one VPN or WireGuard profile in NetworkManager (it is chosen in Settings);
+- the kill switch installed (otherwise the line will show `OFF`) and the sudoers rules
+  from "Installation".
 
 ### Installation and removal
 
@@ -348,93 +584,180 @@ journalctl --user -u vpn-tray.service
 
 While the icon is running as a unit, a second instance started manually exits immediately.
 
-### Why the counter needs a sudoers rule
+## Settings
 
-The packet counter is read with the `nft` command, which needs root. The menu must not ask
-for a password, so the same sudoers rule as for `vpn-stats.sh` is used
-(it may already exist):
-
-```bash
-sudo visudo -f /etc/sudoers.d/vpn-stats
-```
-
-```
-youruser ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch output
-```
-
-The rule allows exactly one command. Without it the other menu lines work,
-and the kill switch line will show `counter unavailable`.
-
-To also read the `forward` chain (dropped traffic of Docker containers), add a second
-line to the same file:
-
-```
-youruser ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch forward
-```
-
-Currently the icon does not read this chain; the line is only needed for future
-use or for manual queries.
-
-### Settings window
-
-The `Settings…` menu item opens a separate "VPN-L2TP Settings" window in the center of
+The `Settings…` menu item opens a separate "VPN kill-switch Settings" window in the center of
 the screen (a second window is not created: choosing the item again brings the open one
-to the front). Closing the window does not stop the icon. For now it contains a single
-toggle, **Kill switch**.
+to the front). Closing the window does not stop the icon. It contains two rows:
 
-The toggle only selects the desired state and does not run anything by itself.
+- **VPN connection**: a dropdown with all VPN and WireGuard profiles of NetworkManager, sorted by
+  name. This is the profile that the tray, the watchdog, the statistics and the kill switch follow.
+  If NetworkManager has no such profiles, the dropdown is disabled and shows
+  `No VPN profiles in NetworkManager`;
+- **Kill switch**: a toggle that enables or disables `vpn-killswitch.service`.
+
+The choice is stored in `~/.config/vpn-killswitch/settings.conf` (`$XDG_CONFIG_HOME` is respected):
+
+```
+[vpn]
+uuid = 00000000-0000-0000-0000-000000000000
+```
+
+The file holds the UUID of the profile, so renaming the profile does not matter. The tray is the
+only writer; the watchdog and `vpn-stats.sh` read the file. Until a profile is selected the file does
+not exist, and the tray shows `VPN: not selected` with the `network-wired-disconnected-symbolic` icon
+and a disabled `Reconnect VPN`; the watchdog does nothing.
+
+The controls only select the desired state and do not run anything by themselves.
 At the bottom right there are two buttons: `Cancel` and `Save` (Enter triggers `Save`).
-On `Save`, if the state has changed, the following is run:
-`sudo -n systemctl enable --now vpn-killswitch.service` (to enable) or
-`sudo -n systemctl disable --now vpn-killswitch.service` (to disable); while the command
-is running, the buttons are unavailable. After a successful save the window closes; if
-the state has not changed, `Save` simply closes the window. `Cancel` (as well as Escape
-and the close button) closes the window without changes and without running any commands. On an error the window
-stays open, a hint appears under the toggle (for example, about the
-sudoers rules), the toggle stays in the selected position, and after fixing the problem you can
-press `Save` again. The initial toggle position is taken from
-`systemctl is-active`; as long as the user has not touched it, it is updated together with the
-`Kill switch: …` line in the menu. The state persists across reboots:
-a disabled kill switch will not turn itself back on until it is enabled again (in this window
-or with `sudo systemctl enable --now vpn-killswitch.service`).
+`Cancel` (as well as Escape and the close button) closes the window without changes and without
+running any commands. If nothing was changed, `Save` simply closes the window.
+
+**What `Save` does.** The steps run one after another, and while they run the controls are
+unavailable:
+
+1. If the VPN connection was changed: the tray takes the server hosts of the new profile and runs
+   `sudo -n /usr/local/sbin/vpn-killswitch-server set HOST...`. This updates the addresses that the
+   kill switch lets through, before anything else is saved. Where the hosts come from: for a VPN
+   profile the first non-empty of `gateway`, `remote`, `address` (OpenVPN may list several `remote`
+   entries; `host:port` forms are reduced to the host); for a WireGuard profile the endpoints of all peers.
+2. The selection is written to the settings file.
+3. If the old profile is active, `nmcli connection down uuid OLD` is run and awaited. Then
+   `nmcli connection up uuid NEW` is started in the background (it is not awaited, so the window
+   does not wait for the VPN to come up).
+4. If the kill switch toggle was changed: `sudo -n systemctl enable --now vpn-killswitch.service` (to
+   enable) or `sudo -n systemctl disable --now vpn-killswitch.service` (to disable).
+
+After a successful save the window closes.
+
+**If something fails**, the window stays open, a hint appears under the rows, the controls
+become available again, and after fixing the problem you can press `Save` again:
+
+- Step 1 fails: nothing is saved and the old VPN is not touched. The messages are
+  `Cannot determine the VPN server for this profile; the kill switch was not updated.` (the profile
+  has no known server host), `Failed to update the kill switch server list: ...` (the helper's error
+  text, for example that the host cannot be resolved), or, when `sudo` wants a password, the hint
+  `No passwordless permission to change the VPN profile.` with the sudoers line to add.
+- Step 2 fails (`Failed to save the settings: ...`): the VPN is not switched.
+- Step 4 fails: the VPN change from steps 1-3 stays applied (the profile is saved, the server list is
+  updated and the new VPN is being connected); only the error is shown, for example
+  `Failed to enable the kill switch: ...` or, without the rules, the hint
+  `No passwordless permission to manage the kill switch.` with the two sudoers lines. The toggle stays
+  in the selected position. A retry no longer sees a VPN change and repeats only this step.
+
+The initial position of the toggle is taken from `systemctl is-active`; as long as the user has not
+touched it, it is updated together with the `Kill switch: …` line in the menu. The state persists
+across reboots: a disabled kill switch will not turn itself back on until it is enabled again (in
+this window or with `sudo systemctl enable --now vpn-killswitch.service`).
 
 Under Wayland an application cannot position its own window, so the unit starts
 the tray with `GDK_BACKEND=x11` (through XWayland): this does not affect the icon, and the window
 opens in the center.
 
-Passwordless `sudo -n` works only if the sudoers rules are in place. Add two
-lines to the same file as for the counter:
+Passwordless `sudo -n` works only if the sudoers rules from "Installation" are in place. Without
+them `Save` will not work: the window will stay open and show a hint with the missing lines.
+`install-tray.sh` checks this and prints a warning if the permissions are missing.
+
+## Watchdog
+
+The watchdog keeps the VPN profile selected in Settings connected. Every 3 seconds it reads the
+profile UUID from `~/.config/vpn-killswitch/settings.conf` (`$XDG_CONFIG_HOME` is respected) and, if
+that profile is not among the active NetworkManager connections, runs
+`nmcli connection up uuid <UUID>` (and writes `watchdog: bringing up <UUID>` to the journal). The file
+is read on every iteration, so a profile change in Settings takes effect within seconds without
+restarting anything. While no profile is selected, there is nothing to do. The kill switch covers
+the time between a drop and the reconnect.
 
 ```bash
-sudo visudo -f /etc/sudoers.d/vpn-stats
+./watchdog/install-watchdog.sh
+./watchdog/uninstall-watchdog.sh
 ```
 
-```
-youruser ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now vpn-killswitch.service
-youruser ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now vpn-killswitch.service
+Both scripts are run as a regular user, without `sudo`. Installation puts the unit at
+`~/.config/systemd/user/vpn-watchdog.service` with the absolute path to `vpn-watchdog.sh` from this
+folder, then runs `systemctl --user daemon-reload` and `enable --now`. If the repository is moved, run
+`install-watchdog.sh` again. Removal stops the unit, disables it and deletes the file; the VPN
+connection stays up. The unit restarts after 5 s if the script crashes. There is deliberately no
+`ExecStop`: stopping the watchdog does not bring the VPN down.
+
+Because the profile is brought up whenever it is down, a manual `nmcli connection down` is undone within
+a few seconds. To keep the VPN off, stop the watchdog first:
+
+```bash
+systemctl --user stop vpn-watchdog.service
 ```
 
-Without them `Save` will not work: the window will stay open and show a hint
-with these lines. `install-tray.sh` checks this and prints a warning
-if the permissions are missing.
+Status and log:
+
+```bash
+systemctl --user status vpn-watchdog.service
+journalctl --user -u vpn-watchdog.service
+```
+
+Two watchdogs must not run at once: disable an older custom one such as `old-vpn-watchdog.service`
+(see "Installation").
+
+For tests, two environment variables are supported when running `./watchdog/vpn-watchdog.sh` by hand:
+`VPN_WATCHDOG_DRY_RUN=1` prints the `nmcli` command instead of running it, and `VPN_WATCHDOG_ONCE=1`
+does a single iteration and exits.
+
+```bash
+VPN_WATCHDOG_DRY_RUN=1 VPN_WATCHDOG_ONCE=1 ./watchdog/vpn-watchdog.sh
+```
 
 ## Troubleshooting
 
 **The VPN does not connect after installation.** Look at the counter on the `drop` rule
 in `sudo nft list table inet killswitch`. If it grows during a connection attempt,
 most likely the server IP has changed or the name does not resolve. Check
-`getent hosts vpn.example.com` and the `vpn_server` set.
+`getent hosts <vpn-gateway-host>` and `sudo vpn-killswitch-server show`.
 
 If IPsec comes up (the journal shows `strongSwan IPsec connection is up`), but then
 `kl2tpd` reports `operation not permitted` and the connection fails with a timeout, then
-UDP 1701 is being blocked before encryption. Check that the rule for port 1701
-is in place.
+traffic to the server is being blocked before encryption: the address the VPN talks to
+is most likely missing from the allowed servers. Compare it with the output of
+`sudo vpn-killswitch-server show`.
+
+**Something is blocked and you do not know what.** Open the tray's "Dropped packets" window (click the
+`Kill switch: …` menu line) and look at the destinations, or run:
+
+```bash
+journalctl -k --grep KS-DROP
+```
+
+Each line shows the interface (`OUT=`), the source and destination addresses, the protocol and ports,
+and for the `output` chain the sender (`UID=`). If the window says `Failed to read the journal`, the
+user cannot read the kernel journal: add yourself to the `adm` group and log in again. If nothing is listed
+although the counter grows, the rules were installed without the `log` rules: run `./install.sh` again.
+
+**The VPN server IP changed.** The addresses are resolved when they are saved, so a new IP
+of the same host name is not known to the kill switch. Run:
+
+```bash
+sudo vpn-killswitch-server refresh
+```
+
+It re-resolves the saved hosts, checks and reloads the rules.
+
+**`Save` in Settings fails with a sudoers hint.** The tray runs `sudo -n` and cannot ask for a
+password. Add the lines from the hint (or all four from "Installation", "The sudoers rules") to
+`/etc/sudoers.d/vpn-stats` with `sudo visudo -f /etc/sudoers.d/vpn-stats` and press `Save` again.
+If the helper is missing (the kill switch is not installed), run `./install.sh --server <vpn-gateway-host>` first.
+
+**The tray shows `VPN: not selected` or `VPN: profile not found`.** The first means that no
+profile is chosen yet (no settings file): open `Settings…`, select the VPN connection and press
+`Save`. The second means that the selected profile was deleted from NetworkManager: choose another
+one in `Settings…`.
+
+**`vpn-stats.sh` prints `No VPN profile selected.`** Select a profile in the tray Settings or pass
+`--vpn NAME`.
 
 **No internet while the VPN is connected.** Make sure the VPN interface is named
-`ppp*`: `ip -br link | grep ppp`. If the VPN is of another type, see "A different VPN type".
+`ppp*`, `tun*`, `tap*` or `wg*`: `ip -br link`. If the VPN uses another name, see
+"A tunnel interface with another name".
 
 **Docker containers cannot reach the internet.** This is by design while the VPN is off.
-With the VPN on, check that the default route points to `ppp*`:
+With the VPN on, check that the default route points to the tunnel interface:
 `ip route show default`.
 
 **The rules disappeared after a reboot.** Check that the service is enabled:

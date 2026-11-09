@@ -1,0 +1,15 @@
+[Unit]
+Description=VPN watchdog: keeps the selected VPN profile connected
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash @WATCHDOG_DIR@/vpn-watchdog.sh
+# There is deliberately no ExecStop that brings the VPN down:
+# stopping the watchdog must not drop the connection.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
