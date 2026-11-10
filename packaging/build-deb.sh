@@ -52,6 +52,7 @@ FILES=(
     "packaging/sudoers|etc/sudoers.d/vpn-kill-switch|0440"
     "README.md|usr/share/doc/vpn-kill-switch/README.md|0644"
     "LICENSE|usr/share/doc/vpn-kill-switch/copyright|0644"
+    "CHANGELOG.md|usr/share/doc/vpn-kill-switch/CHANGELOG.md|0644"
 )
 MAINTAINER_SCRIPTS=(preinst postinst prerm postrm)
 

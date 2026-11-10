@@ -15,6 +15,10 @@ addresses up to date.
 
 Repository: <https://github.com/localhost1982/vpn-kill-switch>
 
+Download: [vpn-kill-switch_1.0.0_all.deb](https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.0.0/vpn-kill-switch_1.0.0_all.deb)
+(the latest version is always on the [Releases page](https://github.com/localhost1982/vpn-kill-switch/releases/latest)).
+What changed between versions: [CHANGELOG.md](CHANGELOG.md).
+
 ## Screenshots
 
 The windows of the tray icon (the data in the screenshots is made up).
@@ -61,6 +65,7 @@ The repository:
 | `packaging/conffiles` | The list of configuration files that dpkg protects on upgrade. |
 | `docs/screenshots/` | The screenshots shown in this README. |
 | `LICENSE` | The MIT License. |
+| `CHANGELOG.md` | What changed in each version. |
 
 Installed as (the layout is defined in `packaging/build-deb.sh`):
 
@@ -79,6 +84,7 @@ Installed as (the layout is defined in `packaging/build-deb.sh`):
 | `README.md` | `/usr/share/doc/vpn-kill-switch/README.md` | 0644 |
 | `docs/screenshots/*.png` | `/usr/share/doc/vpn-kill-switch/docs/screenshots/` | 0644 |
 | `LICENSE` | `/usr/share/doc/vpn-kill-switch/copyright` | 0644 |
+| `CHANGELOG.md` | `/usr/share/doc/vpn-kill-switch/CHANGELOG.md` | 0644 |
 
 Files created while the kill switch is used (they are not part of the package):
 
@@ -223,9 +229,23 @@ The project is installed as a single Debian package (Ubuntu 24.04).
 
 ### 1. Get the package
 
-Either download `vpn-kill-switch_<version>_all.deb` (for example `vpn-kill-switch_1.0.0_all.deb`) from the
-Releases page of the repository: <https://github.com/localhost1982/vpn-kill-switch/releases>, or build it
+Either download `vpn-kill-switch_<version>_all.deb` from the
+[Releases page](https://github.com/localhost1982/vpn-kill-switch/releases/latest) of the repository, or build it
 yourself (see "Building the package"). The package is architecture-independent (`all`).
+
+The current release is 1.0.0:
+[vpn-kill-switch_1.0.0_all.deb](https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.0.0/vpn-kill-switch_1.0.0_all.deb).
+From a terminal:
+
+```bash
+wget https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.0.0/vpn-kill-switch_1.0.0_all.deb
+```
+
+Each release lists the SHA-256 checksum of its file; compare it with the downloaded one:
+
+```bash
+sha256sum vpn-kill-switch_1.0.0_all.deb
+```
 
 ### 2. Install it
 
@@ -431,6 +451,10 @@ dpkg-deb -c dist/vpn-kill-switch_1.0.0_all.deb
 **To change the version**, edit the single line in `VERSION` (for example `1.0.1`) and build again. That one
 number becomes the package version, part of the file name and the version that the About window shows
 (the file is installed as `/usr/lib/vpn-kill-switch/VERSION`).
+
+**To publish a release**: add a section for the new version to `CHANGELOG.md`, update the download link and the
+file names in this README, build the package, tag the commit (`git tag -a v<version>`), push the tag and attach
+`dist/vpn-kill-switch_<version>_all.deb` to a new release on GitHub together with its SHA-256 checksum.
 
 ## Removal
 
