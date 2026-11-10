@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Migration from the old manual (source) install, only when its traces exist.
+set -e
+
+case "$1" in
+install | upgrade) ;;
+*) exit 0 ;;
+esac
+
+OLD_SERVER=/usr/local/sbin/vpn-killswitch-server
+OLD_UNIT=/etc/systemd/system/vpn-killswitch.service
+NFT=/etc/nftables.d/killswitch.nft
+
+if [ -e "$OLD_SERVER" ] || { [ -f "$OLD_UNIT" ] && [ ! -L "$OLD_UNIT" ]; }; then
+    echo "vpn-kill-switch: old manual installation found, migrating"
+    if [ -d /run/systemd/system ]; then
+        if systemctl is-enabled --quiet vpn-killswitch.service 2>/dev/null; then
+            : >/run/vpn-kill-switch.was-enabled
+            echo "vpn-kill-switch: vpn-killswitch.service was enabled, it will be re-enabled"
+        fi
+        # No --now: the nftables table stays loaded, protection is not interrupted.
+        systemctl disable vpn-killswitch.service >/dev/null 2>&1 || true
+        echo "vpn-kill-switch: disabled the old vpn-killswitch.service (rules stay loaded)"
+    fi
+    if [ -f "$OLD_UNIT" ] && [ ! -L "$OLD_UNIT" ]; then
+        rm -f "$OLD_UNIT"
+        echo "vpn-kill-switch: removed $OLD_UNIT"
+    fi
+    if [ -e "$OLD_SERVER" ]; then
+        rm -f "$OLD_SERVER"
+        echo "vpn-kill-switch: removed $OLD_SERVER"
+    fi
+    if [ -e "$NFT" ] && ! dpkg -S "$NFT" >/dev/null 2>&1; then
+        mv -f "$NFT" "$NFT.pre-package"
+        echo "vpn-kill-switch: moved the old $NFT to $NFT.pre-package"
+    fi
+fi
+
+exit 0

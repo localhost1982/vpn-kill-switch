@@ -1,0 +1,22 @@
+Package: vpn-kill-switch
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: all
+Maintainer: Ivan Nikolajtsev <47537294+localhost1982@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: nftables, network-manager, systemd, sudo, python3, python3-gi, gir1.2-gtk-3.0, gir1.2-nm-1.0, gir1.2-ayatanaappindicator3-0.1
+Recommends: gir1.2-notify-0.7, gnome-session-canberra, gnome-shell-extension-appindicator
+Homepage: https://github.com/localhost1982/vpn-kill-switch
+Description: VPN kill switch for NetworkManager VPN profiles
+ An nftables kill switch: while it is on, the internet is reachable only
+ through the VPN tunnel; all other outgoing traffic is blocked, so nothing
+ leaks if the VPN drops.
+ .
+ A watchdog keeps the selected VPN profile connected and reconnects it.
+ A tray icon shows the state, offers a settings window (VPN profile,
+ server list, notifications on VPN drops) and a journal of VPN drops.
+ A statistics command, vpn-stats, summarises connection history.
+ .
+ The kill switch is NOT enabled at install time. Open the tray icon,
+ choose Settings, select the VPN profile and turn the kill switch on.

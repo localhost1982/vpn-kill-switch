@@ -6,7 +6,7 @@ Wants=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash @WATCHDOG_DIR@/vpn-watchdog.sh
+ExecStart=/bin/bash /usr/lib/vpn-kill-switch/vpn-watchdog.sh
 # There is deliberately no ExecStop that brings the VPN down:
 # stopping the watchdog must not drop the connection.
 Restart=always

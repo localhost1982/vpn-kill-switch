@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -e
+
+case "$1" in
+remove | deconfigure) ;;
+*) exit 0 ;;
+esac
+
+if [ -d /run/systemd/system ]; then
+    loginctl list-users --no-legend 2>/dev/null | while read -r uid name _; do
+        case "$uid" in '' | *[!0-9]*) continue ;; esac
+        [ "$uid" -ge 1000 ] || continue
+        [ -e "/run/user/$uid/bus" ] || continue
+        runuser -u "$name" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            systemctl --user stop vpn-tray.service vpn-watchdog.service || true
+    done
+    systemctl --global disable vpn-tray.service vpn-watchdog.service >/dev/null 2>&1 || true
+    # ExecStop deletes the nftables table.
+    systemctl disable --now vpn-killswitch.service >/dev/null 2>&1 || true
+fi
+
+exit 0

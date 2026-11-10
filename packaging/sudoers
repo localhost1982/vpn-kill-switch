@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+# vpn-kill-switch: passwordless rights for members of the sudo group.
+# The tray shows the kill switch state (read the live chain).
+%sudo ALL=(root) NOPASSWD: /usr/sbin/nft list chain inet killswitch output
+# The tray toggles the kill switch.
+%sudo ALL=(root) NOPASSWD: /usr/bin/systemctl enable --now vpn-killswitch.service
+%sudo ALL=(root) NOPASSWD: /usr/bin/systemctl disable --now vpn-killswitch.service
+# The tray applies the VPN profile / server list.
+%sudo ALL=(root) NOPASSWD: /usr/sbin/vpn-killswitch-server *

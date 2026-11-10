@@ -1,0 +1,59 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -e
+
+[ "$1" = configure ] || exit 0
+
+UNITS="vpn-tray.service vpn-watchdog.service"
+FRESH=
+[ -n "$2" ] || FRESH=1
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+    if [ -e /run/vpn-kill-switch.was-enabled ]; then
+        systemctl enable vpn-killswitch.service || true
+        rm -f /run/vpn-kill-switch.was-enabled
+    fi
+    # Apply the packaged rules atomically, only when the kill switch is on
+    # (then the generated server file exists).
+    if systemctl is-active --quiet vpn-killswitch.service; then
+        systemctl reload vpn-killswitch.service || true
+    fi
+    # shellcheck disable=SC2086
+    systemctl --global enable $UNITS >/dev/null 2>&1 || true
+
+    loginctl list-users --no-legend 2>/dev/null | while read -r uid name _; do
+        case "$uid" in '' | *[!0-9]*) continue ;; esac
+        [ "$uid" -ge 1000 ] || continue
+        [ -e "/run/user/$uid/bus" ] || continue
+        userctl() {
+            runuser -u "$name" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                systemctl --user "$@"
+        }
+        userctl daemon-reload || true
+        if [ -z "$FRESH" ]; then
+            # shellcheck disable=SC2086
+            userctl try-restart $UNITS || true
+        else
+            userctl start vpn-watchdog.service || true
+            if userctl is-active --quiet graphical-session.target; then
+                userctl start vpn-tray.service || true
+            fi
+        fi
+        home=$(getent passwd "$name" | cut -d: -f6)
+        if [ -n "$home" ] && { [ -e "$home/.config/systemd/user/vpn-tray.service" ] ||
+            [ -e "$home/.config/systemd/user/vpn-watchdog.service" ]; }; then
+            echo "Legacy user units found for $name; remove them so the packaged ones are used:"
+            echo "  systemctl --user disable --now vpn-tray.service vpn-watchdog.service"
+            echo "  rm ~/.config/systemd/user/vpn-tray.service ~/.config/systemd/user/vpn-watchdog.service && systemctl --user daemon-reload"
+            echo "  systemctl --user start vpn-tray.service vpn-watchdog.service"
+        fi
+    done
+fi
+
+if [ -n "$FRESH" ]; then
+    echo "VPN kill switch installed. Open the tray icon → Settings…, choose the VPN profile and turn the kill switch on."
+fi
+
+exit 0

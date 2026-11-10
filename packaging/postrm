@@ -1,0 +1,30 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -e
+
+# Python may have left a bytecode cache next to the tray script; dpkg does not
+# know about it and would keep the directory.
+case "$1" in
+remove | purge)
+    rm -rf /usr/lib/vpn-kill-switch/__pycache__
+    rmdir /usr/lib/vpn-kill-switch 2>/dev/null || true
+    ;;
+esac
+
+case "$1" in
+remove)
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    ;;
+purge)
+    rm -f /etc/nftables.d/killswitch-server.nft /etc/nftables.d/killswitch.nft.pre-package
+    rm -rf /etc/vpn-killswitch
+    rmdir --ignore-fail-on-non-empty /etc/nftables.d 2>/dev/null || true
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+    fi
+    ;;
+esac
+
+exit 0

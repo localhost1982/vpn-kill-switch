@@ -1,0 +1,2 @@
+/etc/nftables.d/killswitch.nft
+/etc/sudoers.d/vpn-kill-switch

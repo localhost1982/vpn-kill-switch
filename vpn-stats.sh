@@ -3,7 +3,8 @@
 # VPN drop and internet-loss statistics for the last N hours.
 # The VPN profile comes from the tray Settings file (or --vpn NAME).
 # Data source: the systemd journal (journalctl). Output: Markdown tables.
-# Usage: ./vpn-stats.sh [hours] [--events] [--vpn NAME]   (details: ./vpn-stats.sh --help)
+# Installed as /usr/bin/vpn-stats; from a git checkout run it as ./vpn-stats.sh.
+# Usage: vpn-stats [hours] [--events] [--vpn NAME]   (details: vpn-stats --help)
 
 set -euo pipefail
 
@@ -30,14 +31,16 @@ export RE_BOOT="kernel: Linux version "
 export RE_HELLO="message=recv message_type=avpMsgTypeHello"
 
 usage() {
-    cat <<'USAGE'
-Usage: vpn-stats.sh [hours] [--events] [--vpn NAME] [-h|--help]
+    local me=${0##*/}
+    cat <<USAGE
+Usage: $me [hours] [--events] [--vpn NAME] [-h|--help]
 
 VPN drop and internet-loss statistics for the last N hours
 (Markdown tables, data source: the systemd journal).
+The package installs this script as "vpn-stats".
 
 The VPN profile is the one selected in the tray Settings window, stored in
-${XDG_CONFIG_HOME:-~/.config}/vpn-killswitch/settings.conf ([vpn] uuid = ...).
+\${XDG_CONFIG_HOME:-~/.config}/vpn-killswitch/settings.conf ([vpn] uuid = ...).
 Use --vpn NAME to look at another profile instead (e.g. its history).
 Drop causes (LCP, on command, other) are detected for pppd-based profiles
 (L2TP, PPTP); for other VPN types only connection events are counted.
@@ -54,11 +57,11 @@ Drop causes (LCP, on command, other) are detected for pppd-based profiles
   -h, --help show this help
 
 Examples:
-  ./vpn-stats.sh            # the last hour
-  ./vpn-stats.sh 0.5        # the last half hour
-  ./vpn-stats.sh 1,5        # an hour and a half
-  ./vpn-stats.sh 3 --events # three hours with the chronology
-  ./vpn-stats.sh 6 --vpn "Work VPN"  # another profile
+  $me            # the last hour
+  $me 0.5        # the last half hour
+  $me 1,5        # an hour and a half
+  $me 3 --events # three hours with the chronology
+  $me 6 --vpn "Work VPN"  # another profile
 
 sudo is not needed, except for the row with the kill switch blocked-packet counter:
 without passwordless sudo it will show "n/a (sudo required)". The script never asks for a password.
@@ -115,6 +118,33 @@ fmt_duration() {
 fmt_time() { date -d "@$1" +%H:%M:%S; }
 fmt_datetime() { date -d "@$1" '+%Y-%m-%d %H:%M'; }
 
+# ini_get SECTION KEY: the value of KEY in [SECTION] of the settings file (first match,
+# surrounding whitespace removed); empty if missing or the file is unreadable.
+ini_get() {
+    [[ -r $SETTINGS_FILE ]] || return 0
+    awk -v want_sec="$1" -v want_key="$2" '
+        /^[[:space:]]*\[/ {
+            line = $0
+            sub(/^[[:space:]]*\[[[:space:]]*/, "", line)
+            sub(/[[:space:]]*\].*$/, "", line)
+            sec = line
+            next
+        }
+        sec == want_sec && /^[[:space:]]*[^#;[:space:]][^=]*=/ {
+            key = $0
+            sub(/[[:space:]]*=.*$/, "", key)
+            sub(/^[[:space:]]+/, "", key)
+            if (key == want_key) {
+                val = $0
+                sub(/^[^=]*=[[:space:]]*/, "", val)
+                gsub(/[[:space:]]+$/, "", val)
+                print val
+                exit
+            }
+        }
+    ' "$SETTINGS_FILE"
+}
+
 # Determine VPN_NAME and VPN_UUID: --vpn NAME (VPN_NAME_ARG) overrides the settings file.
 resolve_vpn() {
     VPN_NAME=""
@@ -123,10 +153,8 @@ resolve_vpn() {
         VPN_NAME=$VPN_NAME_ARG
         VPN_UUID=$(nmcli -g connection.uuid connection show "$VPN_NAME" 2>/dev/null | head -n1 || true)
     else
-        if [[ -r $SETTINGS_FILE ]]; then
-            VPN_UUID=$(sed -n 's/^[[:space:]]*uuid[[:space:]]*=[[:space:]]*//p' "$SETTINGS_FILE" | head -n1 || true)
-            VPN_UUID=${VPN_UUID%%[[:space:]]*}
-        fi
+        VPN_UUID=$(ini_get vpn uuid)
+        VPN_UUID=${VPN_UUID%%[[:space:]]*}
         if [[ -n $VPN_UUID ]]; then
             VPN_NAME=$(nmcli -g connection.id connection show "$VPN_UUID" 2>/dev/null | head -n1 || true)
         fi
@@ -436,7 +464,11 @@ echo "| Metric | Value |"
 echo "|---|---:|"
 echo "| $VPN_NAME | $VPN_NOW |"
 echo "| Kill switch (vpn-killswitch.service) | $(unit_state systemctl is-active vpn-killswitch.service) |"
-echo "| Watchdog (vpn-watchdog.service) | $(unit_state systemctl --user is-active vpn-watchdog.service) |"
+case $(ini_get watchdog enabled | tr '[:upper:]' '[:lower:]') in
+    false|no|0|off) WATCHDOG_NOW="disabled in settings" ;;
+    *)              WATCHDOG_NOW=$(unit_state systemctl --user is-active vpn-watchdog.service) ;;
+esac
+echo "| Watchdog (vpn-watchdog.service) | $WATCHDOG_NOW |"
 echo "| Blocked by kill switch, packets | $(killswitch_drops) |"
 
 if (( SHOW_EVENTS )); then
