@@ -13,6 +13,8 @@ Built for Ubuntu with NetworkManager. Implementation: a single nftables table, a
 unit that loads it at boot and a small root helper that keeps the VPN server addresses
 up to date.
 
+Repository: <https://github.com/localhost1982/vpn-kill-switch>
+
 ## Contents
 
 | File | Purpose |
@@ -146,6 +148,17 @@ the `inet killswitch` table is recreated, and all other tables stay as they were
 
 ## Installation
 
+Get the sources. The tray and the watchdog run from this directory, so keep it in a
+permanent place:
+
+```bash
+git clone https://github.com/localhost1982/vpn-kill-switch.git
+```
+
+```bash
+cd vpn-kill-switch
+```
+
 ### 1. The kill switch
 
 ```bash
@@ -157,9 +170,9 @@ that NetworkManager knows, sorted by name. Each line reads `NAME  (type, server 
 
 ```
 Select the VPN profile for the kill switch, the tray and the watchdog:
-  Office PPTP  (vpn, vpn.example.com)
-  Office VPN  (vpn, vpn.example.com)
-  VPN-L2TP  (vpn, vpn.example.com)
+  Home WireGuard  (wireguard, wg.example.net)
+  Office L2TP  (vpn, vpn.example.com)
+  Office OpenVPN  (vpn, vpn.example.com)
 ```
 
 Move with `Up`/`Down` (or `k`/`j`) and press `Enter`; no typing is needed. The current line is
@@ -227,14 +240,8 @@ selected; open `Settings…` in the tray menu to change it.
 ./watchdog/install-watchdog.sh
 ```
 
-See "Watchdog" below. The script warns if an older fixed-profile watchdog is still running:
-
-```
-An older watchdog old-vpn-watchdog.service is enabled; it keeps reconnecting a fixed profile. Disable it: systemctl --user disable --now old-vpn-watchdog.service
-```
-
-Two watchdogs would fight each other, so disable the older one (such as a custom
-`old-vpn-watchdog.service`) with the command from the hint.
+See "Watchdog" below. If you already run a watchdog of your own for the same VPN, disable it
+first: two watchdogs would fight each other.
 
 ### 4. The sudoers rules
 
@@ -855,8 +862,7 @@ systemctl --user status vpn-watchdog.service
 journalctl --user -u vpn-watchdog.service
 ```
 
-Two watchdogs must not run at once: disable an older custom one such as `old-vpn-watchdog.service`
-(see "Installation").
+Two watchdogs must not run at once: disable any other watchdog you run for the same VPN.
 
 For tests, two environment variables are supported when running `./watchdog/vpn-watchdog.sh` by hand:
 `VPN_WATCHDOG_DRY_RUN=1` prints the `nmcli` command instead of running it, and `VPN_WATCHDOG_ONCE=1`

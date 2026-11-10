@@ -19,12 +19,6 @@ if ! command -v nmcli >/dev/null 2>&1; then
     exit 1
 fi
 
-# An older fixed-profile watchdog would fight with this one.
-if systemctl --user is-enabled old-vpn-watchdog.service >/dev/null 2>&1 \
-    || systemctl --user is-active old-vpn-watchdog.service >/dev/null 2>&1; then
-    echo "An older watchdog old-vpn-watchdog.service is enabled; it keeps reconnecting a fixed profile. Disable it: systemctl --user disable --now old-vpn-watchdog.service" >&2
-fi
-
 # The unit with the script path substituted in.
 ESC=${DIR//\\/\\\\}
 ESC=${ESC//&/\\&}

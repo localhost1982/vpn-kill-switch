@@ -32,7 +32,7 @@ from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
 
 APP_NAME = "VPN kill switch"
 APP_VERSION = "1.0.0"
-APP_WEBSITE = ""  # repository URL, to be filled in later
+APP_WEBSITE = "https://github.com/localhost1982/vpn-kill-switch"
 APP_AUTHOR = "Ivan Nikolajtsev"
 APP_COPYRIGHT = "Copyright © 2026 Ivan Nikolajtsev"
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
