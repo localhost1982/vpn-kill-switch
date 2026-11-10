@@ -558,7 +558,7 @@ close it, and the icon keeps running. It shows which packets the kill switch blo
 access to the kernel journal (the user must be in the `adm` or `systemd-journal` group).
 
 - **Period**: `Last hour`, `Last 6 hours`, `Last 24 hours`, `This session` (since the tray icon
-  was started) or `Since boot` (the default). The list is
+  was started), `Since boot` (the default) or `All time` (the whole persistent journal, all boots). The list is
   reloaded when the period changes. The longer periods read the persistent kernel journal, so they
   can reach back before the last boot;
 - **Group identical flows** (on by default): one row per combination of protocol, destination
@@ -598,7 +598,8 @@ must be in the `adm` or `systemd-journal` group). If no profile is selected in S
 `No VPN profile selected`.
 
 - **Period**: the same as in the "Dropped packets" window: `Last hour`, `Last 6 hours`, `Last 24 hours`,
-  `This session` (since the tray icon was started) or `Since boot` (the default). The list is reloaded
+  `This session` (since the tray icon was started), `Since boot` (the default) or `All time` (the whole
+  persistent journal). The list is reloaded
   when the period changes; **Refresh** reloads it, **Close** closes the window. The controls are
   unavailable while it loads;
 - **Columns**: `Time` (`HH:MM:SS` for today, `YYYY-MM-DD HH:MM:SS` otherwise), `Event`, `Details` and

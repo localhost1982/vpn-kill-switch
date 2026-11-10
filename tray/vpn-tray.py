@@ -1187,6 +1187,7 @@ class JournalWindow(Gtk.Window):
         ("24h", "Last 24 hours", ["--since", "-24h"]),
         ("session", "This session", None),  # since the tray started, computed in session_args()
         ("boot", "Since boot", ["-b"]),
+        ("all", "All time", []),  # the whole persistent journal, all boots
     )
 
     def __init__(self, tray, title, options=()):
