@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Install the VPN tray icon: check dependencies and enable the user unit.
 # Run: ./tray/install-tray.sh (as a regular user, without sudo).
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Remove the VPN tray icon: stop and delete the user unit.
 # Run: ./tray/uninstall-tray.sh (as a regular user, without sudo).
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Manages the VPN server addresses allowed by the kill switch.
 # Installed as /usr/local/sbin/vpn-killswitch-server (run as root, e.g. via sudo).
 #

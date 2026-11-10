@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Installs and enables the VPN kill switch (nftables + systemd).
 # Takes killswitch.nft, vpn-killswitch.service and vpn-killswitch-server.sh
 # from the script's directory.

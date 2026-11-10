@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # VPN watchdog: keeps the VPN profile selected in the tray Settings connected.
 # Every 3 seconds it reads the profile UUID from
 # $XDG_CONFIG_HOME/vpn-killswitch/settings.conf (default ~/.config/...) and brings

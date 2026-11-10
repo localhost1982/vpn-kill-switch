@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 [Unit]
 Description=VPN kill switch (nftables): internet only via the VPN tunnel
 # Load the rules before NetworkManager brings the network up.

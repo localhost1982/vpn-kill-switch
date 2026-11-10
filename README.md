@@ -20,6 +20,7 @@ up to date.
 | `killswitch.nft` | Generic nftables rules. Installed to `/etc/nftables.d/killswitch.nft`. |
 | `vpn-killswitch.service` | systemd unit that loads the rules before the network comes up. Installed to `/etc/systemd/system/`. |
 | `vpn-killswitch-server.sh` | Root helper that resolves the VPN server host names and writes the allowed server addresses. Installed to `/usr/local/sbin/vpn-killswitch-server`. |
+| `LICENSE` | The MIT License. |
 | `install.sh` | Installation and enabling. Offers a menu of the NetworkManager VPN profiles (or `--vpn NAME`) and sets up the kill switch, the tray and the watchdog for the chosen one. |
 | `uninstall.sh` | Disabling and complete removal. |
 | `vpn-stats.sh` | Statistics of VPN drops and internet outages of the selected profile for the last N hours. |
@@ -531,6 +532,7 @@ clicking the `Kill switch: …` line opens the "Dropped packets" window and clic
 - `Reconnect VPN` brings the selected profile down (if it is active) and up again with `nmcli`, in the background
   (it is unavailable while no profile is selected);
 - `Settings…` opens the settings window (see "Settings" below);
+- `About` opens the About window: the program name, the version with the commit hash and date, a short description, the project and settings paths, the license and the author;
 - `Quit` closes the icon (the unit is not restarted in that case, see below).
 
 The icon writes durations in short forms: `12s`, `3m 05s`, `1h 02m`,
@@ -922,3 +924,7 @@ With the VPN on, check that the default route points to the tunnel interface:
 **The rules disappeared after a reboot.** Check that the service is enabled:
 `systemctl is-enabled vpn-killswitch.service`. If you enabled `nftables.service`,
 its `flush ruleset` deletes the table. Disable it or remove `flush ruleset`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

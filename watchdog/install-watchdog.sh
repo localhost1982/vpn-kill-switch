@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Install the VPN watchdog: enable the user unit.
 # Run: ./watchdog/install-watchdog.sh (as a regular user, without sudo).
 

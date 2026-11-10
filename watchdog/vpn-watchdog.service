@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 [Unit]
 Description=VPN watchdog: keeps the selected VPN profile connected
 After=graphical-session.target

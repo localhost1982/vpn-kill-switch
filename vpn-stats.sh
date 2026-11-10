@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # VPN drop and internet-loss statistics for the last N hours.
 # The VPN profile comes from the tray Settings file (or --vpn NAME).
 # Data source: the systemd journal (journalctl). Output: Markdown tables.

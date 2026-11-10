@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 # VPN icon in the GNOME top bar: state of the selected VPN profile, uptime, kill switch
 # state with the number of logged dropped packets, number of VPN drops. Uses the AppIndicator protocol (StatusNotifierItem).
 # Run: ./vpn-tray.py (normally via the user unit vpn-tray.service).
@@ -28,6 +29,13 @@ gi.require_version("AyatanaAppIndicator3", "0.1")
 gi.require_version("NM", "1.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, NM  # noqa: E402
 from gi.repository import AyatanaAppIndicator3 as AppIndicator  # noqa: E402
+
+APP_NAME = "VPN kill switch"
+APP_VERSION = "1.0.0"
+APP_WEBSITE = ""  # repository URL, to be filled in later
+APP_AUTHOR = "Ivan Nikolajtsev"
+APP_COPYRIGHT = "Copyright © 2026 Ivan Nikolajtsev"
+PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 KILLSWITCH_UNIT = "vpn-killswitch.service"
 WATCHDOG_UNIT = "vpn-watchdog.service"  # user unit (systemctl --user): keeps the selected VPN profile connected
@@ -135,6 +143,97 @@ def run(cmd, timeout=5):
     except Exception as e:  # timeout, command not found, etc.
         log("%s: %s" % (" ".join(cmd), e))
         return None, ""
+
+
+_app_version = None
+
+
+def app_version():
+    """APP_VERSION plus the short hash and date of the last git commit, when available (cached)."""
+    global _app_version
+    if _app_version is None:
+        _app_version = APP_VERSION
+        rc, out = run(["git", "-C", PROJECT_DIR, "log", "-1", "--format=%h %cs"], timeout=3)
+        parts = out.split()
+        if rc == 0 and len(parts) == 2:
+            _app_version = "%s (%s, %s)" % (APP_VERSION, parts[0], parts[1])
+    return _app_version
+
+
+def tilde(path):
+    """path with the home directory shortened to ~."""
+    home = os.path.expanduser("~")
+    if path == home or path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+ABOUT_SUMMARY = ("Blocks internet access that bypasses the VPN and keeps the selected "
+                 "NetworkManager VPN profile connected.")
+ABOUT_COMPONENTS = (
+    "\u2022 Kill switch: nftables rules that let traffic out only through the VPN tunnel\n"
+    "\u2022 Watchdog: reconnects the selected profile when it drops\n"
+    "\u2022 Tray icon: VPN state, drop notifications, dropped packets and VPN drops history\n"
+    "\u2022 Statistics: vpn-stats.sh, drop statistics from the system journal")
+
+
+def about_paths():
+    return "Project: %s (see README.md)\nSettings: %s" % (tilde(PROJECT_DIR), tilde(SETTINGS_PATH))
+
+
+def build_about_dialog():
+    dlg = Gtk.AboutDialog()
+    dlg.set_program_name(APP_NAME)
+    dlg.set_version(app_version())
+    dlg.set_logo_icon_name(ICON_ACTIVE)
+    dlg.set_icon_name(ICON_ACTIVE)
+    dlg.set_position(Gtk.WindowPosition.CENTER)
+    dlg.set_comments(ABOUT_SUMMARY)
+    dlg.set_copyright(APP_COPYRIGHT)
+    dlg.set_license_type(Gtk.License.MIT_X11)
+    dlg.set_authors([APP_AUTHOR])
+    if APP_WEBSITE:
+        dlg.set_website(APP_WEBSITE)
+        dlg.set_website_label("Repository")
+    dlg.connect("response", lambda d, *_: d.destroy())
+    about_add_details(dlg)
+    return dlg
+
+
+def about_add_details(dlg):
+    """Put the component list (left-aligned) and the paths (centered) right under the summary.
+
+    Gtk.AboutDialog centers its single comments label, and one Gtk.Label cannot mix alignments,
+    so the list goes into its own label inserted after the comments label."""
+    def find(widget):
+        if isinstance(widget, Gtk.Label) and widget.get_text() == ABOUT_SUMMARY:
+            return widget
+        if isinstance(widget, Gtk.Container):
+            for child in widget.get_children():
+                found = find(child)
+                if found is not None:
+                    return found
+        return None
+
+    summary = find(dlg.get_content_area())
+    box = summary.get_parent() if summary is not None else None
+    if not isinstance(box, Gtk.Box):  # unexpected dialog layout: fall back to one centered text
+        dlg.set_comments("%s\n\n%s\n\n%s" % (ABOUT_SUMMARY, ABOUT_COMPONENTS, about_paths()))
+        return
+    components = Gtk.Label(label=ABOUT_COMPONENTS, halign=Gtk.Align.CENTER, selectable=True)
+    components.set_justify(Gtk.Justification.LEFT)  # the lines start at the same left edge
+    components.set_xalign(0)  # no wrapping: one line per item, the dialog widens to fit
+    paths = Gtk.Label(label=about_paths(), halign=Gtk.Align.CENTER, selectable=True)
+    paths.set_justify(Gtk.Justification.CENTER)
+    paths.set_line_wrap(True)
+    paths.set_max_width_chars(60)
+    pos = box.get_children().index(summary)
+    for offset, label in enumerate((components, paths), start=1):
+        box.pack_start(label, False, False, 0)
+        box.reorder_child(label, pos + offset)
+        label.show()
+    dlg.about_components = components  # for tests
+    dlg.about_paths = paths
 
 
 def unit_active(argv_prefix, unit):
@@ -632,7 +731,7 @@ class Tray:
         self.notify_ok = False
         if Notify is not None:
             try:
-                self.notify_ok = bool(Notify.init("VPN kill switch"))
+                self.notify_ok = bool(Notify.init(APP_NAME))
             except Exception as e:
                 log("Notify.init: %s" % e)
         self.sys_bus = None
@@ -652,6 +751,7 @@ class Tray:
 
         self.ks_active = None   # True/False, None if `systemctl is-active` failed to run
         self.settings_win = None  # settings window while it is open
+        self.about_win = None   # "About" window while it is open
         self.drops_win = None   # "Dropped packets" window while it is open
         self.vpn_drops_win = None  # "VPN drops" window while it is open
         self.ks_text = "Kill switch: checking…"
@@ -677,6 +777,8 @@ class Tray:
         self.item_reconnect.connect("activate", self.on_reconnect)
         item_settings = Gtk.MenuItem(label="Settings…")
         item_settings.connect("activate", self.on_settings)
+        item_about = Gtk.MenuItem(label="About")
+        item_about.connect("activate", self.on_about)
         item_quit = Gtk.MenuItem(label="Quit")
         item_quit.connect("activate", lambda *_: Gtk.main_quit())
 
@@ -686,6 +788,7 @@ class Tray:
         self.menu.append(Gtk.SeparatorMenuItem())
         self.menu.append(self.item_reconnect)
         self.menu.append(item_settings)
+        self.menu.append(item_about)
         self.menu.append(item_quit)
         self.menu.connect("show", self.on_menu_show)
         self.menu.show_all()
@@ -763,6 +866,19 @@ class Tray:
 
     def on_settings_destroy(self, *_):
         self.settings_win = None
+
+    def on_about(self, *_):
+        if self.about_win is not None:
+            self.about_win.present()
+            return
+        win = build_about_dialog()
+        win.connect("destroy", self.on_about_destroy)
+        self.about_win = win
+        win.show()
+        win.present()
+
+    def on_about_destroy(self, *_):
+        self.about_win = None
 
     def open_drops_window(self, *_):
         if self.drops_win is not None:

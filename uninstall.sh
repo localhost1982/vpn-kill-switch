@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Disables and removes the VPN kill switch (nftables + systemd).
 set -euo pipefail
 

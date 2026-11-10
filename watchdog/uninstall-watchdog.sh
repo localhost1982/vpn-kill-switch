@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 # Remove the VPN watchdog: stop and delete the user unit (the VPN connection stays up).
 # Run: ./watchdog/uninstall-watchdog.sh (as a regular user, without sudo).
 

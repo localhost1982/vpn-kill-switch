@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 [Unit]
 Description=VPN tray indicator
 After=graphical-session.target
