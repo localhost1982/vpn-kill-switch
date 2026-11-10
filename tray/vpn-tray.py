@@ -11,6 +11,7 @@ import os
 import pwd
 import queue
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -41,6 +42,14 @@ ICON_ACTIVE = "org.gnome.Settings-network-symbolic"  # the "Network" icon from G
 ICON_ACTIVATING = "network-wired-acquiring-symbolic"
 ICON_OFF = "network-wired-disconnected-symbolic"
 
+# VPN drop notification. A drop is a transition of the selected profile from connected to anything else
+# that the tray did not cause itself (see drop_event()).
+EXPECT_DOWN_SECONDS = 15    # after the tray's own Reconnect / profile change: its `connection down` is no drop
+RESUME_QUIET_SECONDS = 20   # after resume from suspend: the VPN reconnects by itself, not a drop
+DROP_SOUND_INTERVAL = 30    # at most one drop sound per this many seconds
+DROP_SOUND_ID = "network-connectivity-lost"  # freedesktop sound theme event
+DROP_SOUND_FILE = "/usr/share/sounds/freedesktop/stereo/network-connectivity-lost.oga"  # pw-play fallback
+
 # pppd line patterns. `journalctl -o cat` prints only the message text,
 # without the "pppd[PID]:" prefix; the process is selected via _COMM=pppd.
 RE_LCP = re.compile(r"^No response to [0-9]+ echo-requests", re.M)
@@ -69,6 +78,14 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+try:  # optional: without the binding the tray runs without drop notifications
+    gi.require_version("Notify", "0.7")
+    from gi.repository import Notify  # noqa: E402
+except (ValueError, ImportError) as _e:
+    Notify = None
+    log("gir1.2-notify-0.7 is missing, no VPN drop notifications: %s" % _e)
+
+
 def fmt_duration(s):
     """Seconds -> "12s" / "3m 05s" / "1h 02m" / "1d 03h"."""
     s = int(s)
@@ -79,6 +96,23 @@ def fmt_duration(s):
     if s < 86400:
         return "%dh %02dm" % (s // 3600, (s % 3600) // 60)
     return "%dd %02dh" % (s // 86400, (s % 86400) // 3600)
+
+
+def drop_event(prev, now_connected, now, expect_down_until, sleeping, quiet_until):
+    """Decide what a refresh of the selected profile's state means. Pure function.
+
+    prev, now_connected: True (ACTIVATED) / False (anything else) / None (unknown: no profile selected,
+    profile not found, NetworkManager unavailable, tray just started). Returns "drop" (connected ->
+    not connected, not caused by the tray itself, not during suspend / the quiet period after resume),
+    "reconnect" (not connected -> connected) or None. A first observation (prev None) is never an event.
+    """
+    if prev is None or now_connected is None or prev == now_connected:
+        return None
+    if now_connected:
+        return "reconnect"
+    if now < expect_down_until or sleeping or now < quiet_until:
+        return None
+    return "drop"
 
 
 def plural_packets(n):
@@ -429,26 +463,63 @@ def fmt_time(ts):
     return time.strftime("%Y-%m-%d %H:%M:%S", t)
 
 
-# --- settings (shared with the watchdog and the stats script; the tray is the only writer) ---
+# --- settings (shared with the watchdog and the stats script; written by the tray and install.sh) ---
+
+def read_settings_file():
+    """The settings file as a ConfigParser (empty if it is missing; raises configparser.Error / OSError
+    if it cannot be read or parsed)."""
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.read(SETTINGS_PATH)
+    return cp
+
 
 def load_settings():
     """UUID of the selected VPN profile from SETTINGS_PATH, or None."""
-    cp = configparser.ConfigParser(interpolation=None)
     try:
-        cp.read(SETTINGS_PATH)
-        uuid = cp.get("vpn", "uuid", fallback="").strip()
+        uuid = read_settings_file().get("vpn", "uuid", fallback="").strip()
     except Exception as e:  # unreadable or malformed file
         log("%s: %s" % (SETTINGS_PATH, e))
         return None
     return uuid or None
 
 
-def save_settings(uuid):
-    """Write the selected VPN profile UUID atomically (temp file + rename)."""
+def load_notify_settings():
+    """(popup, sound) from the [notify] section of SETTINGS_PATH; a missing section / key or a bad value is True."""
+    try:
+        cp = read_settings_file()
+    except Exception as e:
+        log("%s: %s" % (SETTINGS_PATH, e))
+        return True, True
+    out = []
+    for key in ("popup", "sound"):
+        try:
+            out.append(cp.getboolean("notify", key, fallback=True))
+        except ValueError as e:
+            log("%s: [notify] %s: %s" % (SETTINGS_PATH, key, e))
+            out.append(True)
+    return out[0], out[1]
+
+
+def save_settings(uuid=None, notify=None):
+    """Update the settings file atomically (temp file + rename). Only what is passed changes:
+    uuid -> [vpn] uuid, notify = (popup, sound) -> [notify]; every other section and key is kept
+    (comments are not). A missing file is created; an unparseable one is replaced."""
     d = os.path.dirname(SETTINGS_PATH)
     os.makedirs(d, mode=0o700, exist_ok=True)
-    cp = configparser.ConfigParser(interpolation=None)
-    cp["vpn"] = {"uuid": uuid}
+    try:
+        cp = read_settings_file()
+    except Exception as e:
+        log("%s: %s (rewriting it)" % (SETTINGS_PATH, e))
+        cp = configparser.ConfigParser(interpolation=None)
+    if uuid is not None:
+        if not cp.has_section("vpn"):
+            cp.add_section("vpn")
+        cp.set("vpn", "uuid", uuid)
+    if notify is not None:
+        if not cp.has_section("notify"):
+            cp.add_section("notify")
+        cp.set("notify", "popup", "true" if notify[0] else "false")
+        cp.set("notify", "sound", "true" if notify[1] else "false")
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".settings.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
@@ -547,6 +618,31 @@ class Tray:
             log("NetworkManager unavailable: %s" % e)
 
         self.vpn_uuid = load_settings()  # UUID of the selected VPN profile, None if not selected
+        self.notify_popup, self.notify_sound = load_notify_settings()
+        # VPN drop detection (see drop_event()).
+        self.vpn_prev = None            # selected profile connected at the previous refresh (None: unknown)
+        self.expect_down_until = 0.0    # epoch: the tray itself takes the VPN down until then
+        self.sleeping = False           # between logind PrepareForSleep(true) and (false)
+        self.quiet_until = 0.0          # epoch: no drop notifications until then (after resume)
+        self.drop_at = None             # epoch of the last notified drop
+        self.drop_popup = False         # the last drop was announced by a popup, the reconnect replaces it
+        self.last_sound_at = 0.0
+        self.sound_warned = False
+        self.notification = None        # the one Notify.Notification, reused so a new text replaces the old
+        self.notify_ok = False
+        if Notify is not None:
+            try:
+                self.notify_ok = bool(Notify.init("VPN kill switch"))
+            except Exception as e:
+                log("Notify.init: %s" % e)
+        self.sys_bus = None
+        try:
+            self.sys_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            self.sys_bus.signal_subscribe(
+                "org.freedesktop.login1", "org.freedesktop.login1.Manager", "PrepareForSleep",
+                "/org/freedesktop/login1", None, Gio.DBusSignalFlags.NONE, self.on_prepare_for_sleep)
+        except Exception as e:
+            log("logind PrepareForSleep: %s" % e)
         self.vpn_conn = None    # its NM.RemoteConnection (None if not selected or deleted)
         self.ac = None          # active connection of the selected profile (if any)
         self.ac_handler = 0
@@ -638,6 +734,7 @@ class Tray:
         if not uuid:
             return
         if self.find_active_uuid(uuid) is not None:
+            self.expect_down_until = time.time() + EXPECT_DOWN_SECONDS  # not a drop
             run_async(["nmcli", "connection", "down", "uuid", uuid],
                       lambda ok, stderr: self.start_vpn(uuid))
         else:
@@ -722,6 +819,8 @@ class Tray:
     def set_vpn(self, uuid):
         """The selection changed (the settings file is already written)."""
         self.vpn_uuid = uuid
+        self.vpn_prev = None  # the drop detector starts over for the new profile
+        self.drop_popup = False
         self.refresh_conn()
 
     def find_active_uuid(self, uuid):
@@ -770,14 +869,17 @@ class Tray:
     def refresh_vpn(self):
         if not self.vpn_uuid:
             self.watch_active(None)
+            self.track_vpn(None, None)
             self.set_state(ICON_OFF, "VPN: not selected", "VPN not selected")
             return
         name = self.vpn_name()
         if self.client is None:
+            self.track_vpn(None, name)
             self.set_state(ICON_OFF, "VPN: state unknown" + (" (%s)" % name if name else ""), "VPN: no data")
             return
         if name is None:  # the selected profile was deleted from NetworkManager
             self.watch_active(None)
+            self.track_vpn(None, None)
             self.set_state(ICON_OFF, "VPN: profile not found", "VPN profile not found")
             return
         try:
@@ -789,6 +891,7 @@ class Tray:
             self.set_state(ICON_OFF, "VPN: state unknown (%s)" % name, "VPN: no data")
             return
 
+        self.track_vpn(state == NM.ActiveConnectionState.ACTIVATED, name)
         if state == NM.ActiveConnectionState.ACTIVATED:
             text = "VPN: connected"
             ts = self.activation_time()
@@ -799,6 +902,91 @@ class Tray:
             self.set_state(ICON_ACTIVATING, "VPN: connecting… (%s)" % name, "VPN connecting")
         else:
             self.set_state(ICON_OFF, "VPN: disconnected (%s)" % name, "VPN disconnected")
+
+    # --- drop notification ---------------------------------------------------
+
+    def on_prepare_for_sleep(self, _conn, _sender, _path, _iface, _signal, params, *_):
+        """logind PrepareForSleep(b): True before suspend, False after resume."""
+        try:
+            going = bool(params.unpack()[0])
+        except Exception as e:
+            log("PrepareForSleep: %s" % e)
+            return
+        self.sleeping = going
+        if not going:
+            self.quiet_until = time.time() + RESUME_QUIET_SECONDS
+
+    def track_vpn(self, connected, name):
+        """Feed the connected state of the selected profile (None: unknown) to the drop detector."""
+        try:
+            now = time.time()
+            ev = drop_event(self.vpn_prev, connected, now, self.expect_down_until, self.sleeping, self.quiet_until)
+            self.vpn_prev = connected
+            if ev == "drop":
+                self.on_vpn_drop(name, now)
+            elif ev == "reconnect":
+                self.on_vpn_reconnect(name, now)
+        except Exception as e:  # never let a notification problem break the tray
+            log("drop notification: %s" % e)
+
+    def show_notification(self, summary, body, icon):
+        """Show (or replace) the one notification. Returns True if it was shown."""
+        if not self.notify_ok:
+            return False
+        try:
+            if self.notification is None:
+                self.notification = Notify.Notification.new(summary, body, icon)
+                self.notification.set_urgency(Notify.Urgency.NORMAL)
+            else:
+                self.notification.update(summary, body, icon)
+            self.notification.show()
+            return True
+        except Exception as e:
+            log("notification: %s" % e)
+            return False
+
+    def play_drop_sound(self, now):
+        """The drop sound: canberra-gtk-play, else pw-play with the theme file. At most one per DROP_SOUND_INTERVAL."""
+        if now - self.last_sound_at < DROP_SOUND_INTERVAL:
+            return
+        argv = None
+        if shutil.which("canberra-gtk-play"):
+            argv = ["canberra-gtk-play", "-i", DROP_SOUND_ID, "-d", "VPN dropped"]
+        elif shutil.which("pw-play") and os.path.exists(DROP_SOUND_FILE):
+            argv = ["pw-play", DROP_SOUND_FILE]
+        if argv is None:
+            if not self.sound_warned:
+                self.sound_warned = True
+                log("no canberra-gtk-play or pw-play: no sound on VPN drops")
+            return
+        try:
+            self.procs.append(subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            self.last_sound_at = now
+        except Exception as e:
+            log("%s: %s" % (argv[0], e))
+
+    def on_vpn_drop(self, name, now):
+        self.drop_at = now
+        self.drop_popup = False
+        if self.notify_popup:
+            when = time.strftime("%H:%M:%S", time.localtime(now))
+            if self.ks_active:
+                tail = "Traffic outside the VPN is blocked by the kill switch."
+            else:
+                tail = "The kill switch is OFF: traffic is NOT protected."
+            self.drop_popup = self.show_notification(
+                "VPN dropped", "%s disconnected at %s. %s" % (name or "VPN", when, tail), ICON_OFF)
+        if self.notify_sound:
+            self.play_drop_sound(now)
+
+    def on_vpn_reconnect(self, name, now):
+        """The profile is connected again: replace the drop popup (only if one was shown), silently."""
+        if not self.drop_popup or self.drop_at is None:
+            return
+        self.drop_popup = False
+        self.show_notification(
+            "VPN reconnected", "%s is back after %s." % (name or "VPN", fmt_duration(now - self.drop_at)), ICON_ACTIVE)
 
     def set_state(self, icon, label, title):
         if self.item_vpn.get_label() != label:
@@ -862,7 +1050,7 @@ class Tray:
 
 
 class SettingsWindow(Gtk.Window):
-    """Settings window: VPN profile, kill switch and watchdog toggles. Applied by the "Save" button."""
+    """Settings window: VPN profile, kill switch, watchdog and drop notification toggles. Applied by the "Save" button."""
 
     def __init__(self, tray):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
@@ -871,6 +1059,10 @@ class SettingsWindow(Gtk.Window):
         self.wd_baseline = False  # watchdog state in the system at open time / after a failed step
         self.wd_want = False    # the watchdog switch position taken at Save
         self.wd_changed = False  # whether the watchdog needs a change (set by on_save)
+        self.popup_want = self.sound_want = True  # the notification switch positions taken at Save
+        self.notify_changed = False  # whether the notification settings need a change (set by on_save)
+        self.popup_baseline = tray.notify_popup  # drop notification settings at open time / last save
+        self.sound_baseline = tray.notify_sound
         self.busy = False       # a Save sequence (sudo / nmcli commands) is still running
         self.closed = False
         self.proc = None        # reference to the Gio.Subprocess while it runs
@@ -931,11 +1123,21 @@ class SettingsWindow(Gtk.Window):
             "Watchdog",
             "Reconnect the selected VPN profile automatically when it drops.",
         )
+        popup_row, self.switch_popup = switch_row(
+            "Drop notification",
+            "Show a notification when the VPN drops.",
+        )
+        sound_row, self.switch_sound = switch_row(
+            "Drop sound",
+            "Play a sound when the VPN drops.",
+        )
         listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         listbox.get_style_context().add_class("frame")
         listbox.add(vpn_row)
         listbox.add(row)
         listbox.add(wd_row)
+        listbox.add(popup_row)
+        listbox.add(sound_row)
 
         self.error_label = Gtk.Label(halign=Gtk.Align.START)
         self.error_label.set_line_wrap(True)
@@ -971,6 +1173,8 @@ class SettingsWindow(Gtk.Window):
         # None (systemctl could not be run) counts as "off". Only the kill switch is re-polled.
         self.wd_baseline = bool(unit_active(["systemctl", "--user"], WATCHDOG_UNIT))
         self.switch_wd.set_active(self.wd_baseline)
+        self.switch_popup.set_active(self.popup_baseline)
+        self.switch_sound.set_active(self.sound_baseline)
 
         self.show_all()
 
@@ -1005,6 +1209,8 @@ class SettingsWindow(Gtk.Window):
     def set_controls_sensitive(self, value):
         self.switch.set_sensitive(value)
         self.switch_wd.set_sensitive(value)
+        self.switch_popup.set_sensitive(value)
+        self.switch_sound.set_sensitive(value)
         self.combo.set_sensitive(value and self.has_profiles)
         self.btn_cancel.set_sensitive(value)
         self.btn_save.set_sensitive(value)
@@ -1020,7 +1226,10 @@ class SettingsWindow(Gtk.Window):
         ks_changed = want != self.baseline
         self.wd_want = self.switch_wd.get_active()
         self.wd_changed = self.wd_want != self.wd_baseline
-        if not vpn_changed and not ks_changed and not self.wd_changed:  # no changes
+        self.popup_want = self.switch_popup.get_active()
+        self.sound_want = self.switch_sound.get_active()
+        self.notify_changed = (self.popup_want, self.sound_want) != (self.popup_baseline, self.sound_baseline)
+        if not vpn_changed and not ks_changed and not self.wd_changed and not self.notify_changed:  # no changes
             self.destroy()
             return
         self.set_controls_sensitive(False)
@@ -1077,6 +1286,7 @@ class SettingsWindow(Gtk.Window):
         self.tray.set_vpn(new_uuid)
         # Step 3: drop the old profile (if it is up), then start the new one in the background.
         if old and self.tray.find_active_uuid(old) is not None:
+            self.tray.expect_down_until = time.time() + EXPECT_DOWN_SECONDS  # not a drop
             self.proc = run_async(
                 ["nmcli", "connection", "down", "uuid", old],
                 lambda ok, stderr: self.on_down_done(new_uuid, want, ks_changed),
@@ -1091,9 +1301,9 @@ class SettingsWindow(Gtk.Window):
 
     # Step 4: the kill switch toggle. If it fails, the VPN change from steps 1-3 stays applied
     # (the profile is saved, the server list is updated); only the error is shown and the window
-    # stays open. A retry then sees no VPN change. The watchdog step (5) is not attempted after
-    # a failed kill switch step: only the kill switch error is shown, and a retry repeats the
-    # kill switch step and then runs the watchdog step.
+    # stays open. A retry then sees no VPN change. The watchdog step (5) and the notification step (6)
+    # are not attempted after a failed kill switch step: only the kill switch error is shown, and a
+    # retry repeats the kill switch step and then runs the later ones.
     def step_killswitch(self, want, ks_changed):
         if not ks_changed:
             self.step_watchdog()
@@ -1110,10 +1320,10 @@ class SettingsWindow(Gtk.Window):
 
     # Step 5: the watchdog toggle (a user unit, no sudo). If it fails, the earlier steps (the VPN
     # profile, the kill switch) stay applied; only the error is shown and the window stays open.
-    # A retry then repeats only this step.
+    # A retry then repeats this step and then the notification step.
     def step_watchdog(self):
         if not self.wd_changed:
-            self.finish_ok()
+            self.step_notify()
             return
         action = "enable" if self.wd_want else "disable"  # with --now: immediately and at the next login
         self.proc = run_async(
@@ -1125,7 +1335,7 @@ class SettingsWindow(Gtk.Window):
         self.proc = None
         if ok:
             self.wd_baseline = self.wd_want
-            self.finish_ok()
+            self.step_notify()
             return
         # Re-read the real state so that a retry compares against it.
         self.wd_baseline = bool(unit_active(["systemctl", "--user"], WATCHDOG_UNIT))
@@ -1139,6 +1349,23 @@ class SettingsWindow(Gtk.Window):
         if "not found" in stderr or "No such file" in stderr or "does not exist" in stderr:
             msg += " Install it with watchdog/install-watchdog.sh."  # the unit file is not installed
         self.show_error(msg)
+
+    # Step 6: the drop notification settings. They need no command, only the settings file, and are written
+    # last on purpose: a failing earlier step then does not leave them half-applied, and a retry (the
+    # switches stay where the user put them) writes them once everything else went through.
+    def step_notify(self):
+        if not self.notify_changed:
+            self.finish_ok()
+            return
+        try:
+            save_settings(notify=(self.popup_want, self.sound_want))
+        except Exception as e:
+            log("save_settings: %s" % e)
+            self.fail("Failed to save the settings: %s" % e)
+            return
+        self.tray.notify_popup, self.tray.notify_sound = self.popup_want, self.sound_want
+        self.popup_baseline, self.sound_baseline = self.popup_want, self.sound_want
+        self.finish_ok()
 
     def finish_ok(self):
         self.tray.refresh_killswitch()

@@ -23,7 +23,7 @@ up to date.
 | `install.sh` | Installation and enabling. Offers a menu of the NetworkManager VPN profiles (or `--vpn NAME`) and sets up the kill switch, the tray and the watchdog for the chosen one. |
 | `uninstall.sh` | Disabling and complete removal. |
 | `vpn-stats.sh` | Statistics of VPN drops and internet outages of the selected profile for the last N hours. |
-| `tray/vpn-tray.py` | VPN icon in the GNOME top bar with a statistics menu and the Settings window (VPN profile, kill switch). |
+| `tray/vpn-tray.py` | VPN icon in the GNOME top bar with a statistics menu, VPN drop notifications and the Settings window (VPN profile, kill switch, watchdog, notifications). |
 | `tray/vpn-tray.service` | `systemd --user` unit that starts the icon after you log in to the session. |
 | `tray/install-tray.sh` | Dependency check, sudoers check, installation and enabling of the icon unit. |
 | `tray/uninstall-tray.sh` | Stops and removes the icon unit. |
@@ -645,11 +645,43 @@ rare cases their number can differ from the total in the bottom line. Drop cause
 profiles (L2TP, PPTP); for other VPN types the window lists only the connection events (`Connecting`,
 `Connected`, `Connect failed`), suspends and boots.
 
+### Drop notifications
+
+When the selected VPN profile drops, the tray shows a GNOME notification and plays a sound. A drop is
+the profile going from connected to anything else (disconnected, or connecting again), seen by the same
+check that refreshes the icon (on libnm events and every 5 s). It is not reported when:
+
+- the tray itself took the VPN down: `Reconnect VPN` or a profile change in Settings (for 15 s after
+  the command);
+- the computer is suspended or has just resumed: the VPN usually reconnects by itself, so drops
+  during suspend and for 20 s after resume are ignored (logind `PrepareForSleep`);
+- the tray started while the VPN was already down (there is no earlier connected state);
+- no profile is selected, the profile was deleted, or NetworkManager does not answer.
+
+The notification reads `VPN dropped` / `My VPN disconnected at 14:03:27. Traffic outside the VPN is blocked
+by the kill switch.`; if the kill switch is not active (or its state is unknown) the second sentence is
+`The kill switch is OFF: traffic is NOT protected.` The tray keeps one notification object, so a new
+drop replaces the previous text instead of stacking banners. When the profile is connected again, the same
+notification is replaced by `VPN reconnected` / `My VPN is back after 2m 05s.`, without a sound (only if
+the popup was shown for that drop).
+
+The sound is the `network-connectivity-lost` event of the freedesktop sound theme, played with
+`canberra-gtk-play`; if that is not installed, `pw-play` plays `network-connectivity-lost.oga` from
+`/usr/share/sounds/freedesktop/stereo/`. At most one sound is played per 30 s, so a flapping VPN does
+not beep continuously (the notification is still updated). The sound is played by the tray itself, not
+by the notification, so it does not depend on the banner: GNOME's Do Not Disturb hides the banner, and
+the sound is still played (if you also turned off system sounds in GNOME Settings, `canberra-gtk-play`
+follows that). Both parts can be switched off in Settings; without `gir1.2-notify-0.7` the tray runs without
+the notification and only logs one line.
+
 ### Requirements
 
 - the packages `python3-gi`, `gir1.2-gtk-3.0`, `gir1.2-nm-1.0`, `gir1.2-ayatanaappindicator3-0.1`
   (usually already installed in Ubuntu; `install-tray.sh` checks for them and, if any are missing,
   prints the `sudo apt install ...` command; it does not run `apt` itself);
+- optional, for the VPN drop notification and sound (see "Drop notifications"): `gir1.2-notify-0.7`
+  and `gnome-session-canberra` (`canberra-gtk-play`). Without them the tray works as before;
+  `install-tray.sh` only warns about each missing one;
 - the AppIndicator extension enabled in GNOME Shell (in Ubuntu this is
   `ubuntu-appindicators@ubuntu.com`). Without it the icon will not appear;
 - at least one VPN or WireGuard profile in NetworkManager (it is chosen in Settings);
@@ -684,7 +716,7 @@ While the icon is running as a unit, a second instance started manually exits im
 
 The `Settings…` menu item opens a separate "VPN kill-switch Settings" window in the center of
 the screen (a second window is not created: choosing the item again brings the open one
-to the front). Closing the window does not stop the icon. It contains three rows:
+to the front). Closing the window does not stop the icon. It contains five rows:
 
 - **VPN connection**: a dropdown with all VPN and WireGuard profiles of NetworkManager, sorted by
   name. This is the profile that the tray, the watchdog, the statistics and the kill switch follow.
@@ -695,17 +727,29 @@ to the front). Closing the window does not stop the icon. It contains three rows
   enables or disables the user unit `vpn-watchdog.service` (see "Watchdog"). It runs
   `systemctl --user enable --now vpn-watchdog.service` or `systemctl --user disable --now
   vpn-watchdog.service`, without `sudo`. The unit is enabled or disabled, not only started or stopped,
-  so the choice persists across logins.
+  so the choice persists across logins;
+- **Drop notification** (`Show a notification when the VPN drops.`) and **Drop sound**
+  (`Play a sound when the VPN drops.`): toggles for the two parts of "Drop notifications". Both are on
+  by default. They run no command: `Save` writes them to the settings file and the tray applies
+  them at once. They are written as the last step of `Save`, after the VPN profile, the kill switch and the
+  watchdog; if one of those steps fails, they are saved when a retry succeeds.
 
 The choice is stored in `~/.config/vpn-killswitch/settings.conf` (`$XDG_CONFIG_HOME` is respected):
 
 ```
 [vpn]
 uuid = 00000000-0000-0000-0000-000000000000
+
+[notify]
+popup = true
+sound = true
 ```
 
-The file holds the UUID of the profile, so renaming the profile does not matter. The tray and
-`install.sh` (which saves the profile you pick in its menu) write the file; the watchdog and
+The file holds the UUID of the profile, so renaming the profile does not matter. The `[notify]` section
+is optional (a missing section or key means `true`). The tray and
+`install.sh` (which saves the profile you pick in its menu) write the file, each changing only its own
+part and keeping the rest (`install.sh` replaces just the `uuid` line, so your `[notify]` choices survive a
+reinstall; the tray rewrites the file through a parser, which drops comments); the watchdog and
 `vpn-stats.sh` read it. Until a profile is selected the file does
 not exist, and the tray shows `VPN: not selected` with the `network-wired-disconnected-symbolic` icon
 and a disabled `Reconnect VPN`; the watchdog does nothing.

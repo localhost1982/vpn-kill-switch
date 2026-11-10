@@ -396,21 +396,56 @@ resolve_target_user() {
     SETTINGS_FILE="$HOME_DIR/.config/vpn-killswitch/settings.conf"
 }
 
+# Prints the settings file content with the `uuid` line of the [vpn] section set to $1. If the file exists
+# everything else is kept as it is (the [notify] section the tray writes, other keys, comments): the uuid
+# line is replaced, or added at the end of [vpn], or the [vpn] section is appended. Otherwise: a new file.
+render_settings() {
+    local uuid="$1"
+    if [[ -n $SETTINGS_FILE && -r $SETTINGS_FILE ]]; then
+        U="$uuid" awk '
+            function flush() { printf "%s", held; held = "" }
+            /^\[[^]]*\]/ {                      # a section header
+                if (in_vpn && !done) { print "uuid = " ENVIRON["U"]; done = 1; flush() }
+                in_vpn = ($0 ~ /^\[vpn\][ \t]*$/)
+                if (in_vpn) seen = 1
+                print; next
+            }
+            in_vpn && !done && /^[ \t]*$/ { held = held $0 "\n"; next }   # blank lines stay after the new uuid line
+            in_vpn && /^[ \t]*uuid[ \t]*[=:]/ {
+                if (!done) { flush(); print "uuid = " ENVIRON["U"]; done = 1 }
+                next                                # a duplicate uuid line is dropped
+            }
+            { flush(); print }
+            END {
+                if (in_vpn && !done) { print "uuid = " ENVIRON["U"]; flush() }
+                if (!seen) { if (NR > 0) print ""; print "[vpn]"; print "uuid = " ENVIRON["U"] }
+            }
+        ' "$SETTINGS_FILE"
+    else
+        printf '[vpn]\nuuid = %s\n' "$uuid"
+    fi
+}
+
 write_settings() {
-    local uuid="$1" dir tmp
+    local uuid="$1" dir tmp line
     dir="$(dirname "$SETTINGS_FILE")"
     if ((DRY_RUN)); then
         [[ -d $HOME_DIR/.config ]] || run install -d -o "$TARGET_USER" -g "$TARGET_GROUP" -m 0700 "$HOME_DIR/.config"
         run install -d -o "$TARGET_USER" -g "$TARGET_GROUP" -m 0700 "$dir"
         echo "[dry-run] write $SETTINGS_FILE (owner $TARGET_USER:$TARGET_GROUP, mode 0644):"
-        printf '[dry-run]   [vpn]\n[dry-run]   uuid = %s\n' "$uuid"
+        while IFS= read -r line || [[ -n $line ]]; do
+            printf '[dry-run]   %s\n' "$line"
+        done < <(render_settings "$uuid")
         return
     fi
     # install -d chowns only the last component: create ~/.config first if missing.
     [[ -d $HOME_DIR/.config ]] || install -d -o "$TARGET_USER" -g "$TARGET_GROUP" -m 0700 "$HOME_DIR/.config"
     install -d -o "$TARGET_USER" -g "$TARGET_GROUP" -m 0700 "$dir"
     tmp="$(mktemp "$dir/.settings.XXXXXX")"
-    printf '[vpn]\nuuid = %s\n' "$uuid" >"$tmp"
+    if ! render_settings "$uuid" >"$tmp"; then
+        rm -f -- "$tmp"
+        die 1 "Cannot write $SETTINGS_FILE."
+    fi
     chown "$TARGET_USER:$TARGET_GROUP" "$tmp"
     chmod 0644 "$tmp"
     mv -f -- "$tmp" "$SETTINGS_FILE"

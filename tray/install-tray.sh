@@ -27,6 +27,18 @@ from gi.repository import Gtk, NM, AyatanaAppIndicator3
     exit 1
 fi
 
+# Optional: VPN drop notifications and sound. Not fatal, the tray works without them.
+if ! python3 -c "
+import gi
+gi.require_version('Notify', '0.7')
+from gi.repository import Notify
+" >/dev/null 2>&1; then
+    echo "Warning: gir1.2-notify-0.7 is missing; the tray will not show VPN drop notifications. Install it: sudo apt install gir1.2-notify-0.7" >&2
+fi
+if ! command -v canberra-gtk-play >/dev/null 2>&1; then
+    echo "Warning: canberra-gtk-play is missing; the tray will not play a sound on VPN drops. Install it: sudo apt install gnome-session-canberra" >&2
+fi
+
 # 2. Passwordless access: unit management and the VPN profile switch from the settings window
 #    (needed by the tray), and reading the nftables counter (needed only by vpn-stats.sh;
 #    the tray counts the dropped packets logged in the journal and needs no sudo for that).
