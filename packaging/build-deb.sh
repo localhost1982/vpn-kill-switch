@@ -55,6 +55,14 @@ FILES=(
 )
 MAINTAINER_SCRIPTS=(preinst postinst prerm postrm)
 
+# Screenshots shown in the README (docs/screenshots/*.png), installed next to it so that the relative
+# image links of the installed README resolve. A missing file (e.g. tray-menu.png) is not an error.
+shopt -s nullglob
+for shot in docs/screenshots/*.png; do
+    FILES+=("$shot|usr/share/doc/vpn-kill-switch/$shot|0644")
+done
+shopt -u nullglob
+
 # ---- checks -----------------------------------------------------------------
 for entry in "${FILES[@]}"; do
     [[ -f ${entry%%|*} ]] || die "missing source file: ${entry%%|*}"

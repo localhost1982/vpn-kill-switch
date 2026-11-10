@@ -15,6 +15,30 @@ addresses up to date.
 
 Repository: <https://github.com/localhost1982/vpn-kill-switch>
 
+## Screenshots
+
+The windows of the tray icon (the data in the screenshots is made up).
+
+The tray menu: the VPN state, the kill switch state and the drop counters (click the icon in the top bar).
+
+![Tray menu](docs/screenshots/tray-menu.png)
+
+Settings: the VPN profile, the kill switch, the watchdog and the drop notification and sound (menu `Settings…`).
+
+![Settings window](docs/screenshots/settings.png)
+
+Dropped packets: what the kill switch blocked, grouped by destination (click the `Kill switch: …` line of the menu).
+
+![Dropped packets window](docs/screenshots/dropped-packets.png)
+
+VPN drops: the chronology of drops and reconnections with the cause and the downtime (click the `VPN drops since boot: …` line of the menu).
+
+![VPN drops window](docs/screenshots/vpn-drops.png)
+
+About: the version, the components and the paths of the documentation and settings (menu `About`).
+
+![About window](docs/screenshots/about.png)
+
 ## Contents
 
 The repository:
@@ -35,6 +59,7 @@ The repository:
 | `packaging/preinst`, `postinst`, `prerm`, `postrm` | Maintainer scripts of the package. |
 | `packaging/sudoers` | The sudoers drop-in with the passwordless rights for the `sudo` group. |
 | `packaging/conffiles` | The list of configuration files that dpkg protects on upgrade. |
+| `docs/screenshots/` | The screenshots shown in this README. |
 | `LICENSE` | The MIT License. |
 
 Installed as (the layout is defined in `packaging/build-deb.sh`):
@@ -52,6 +77,7 @@ Installed as (the layout is defined in `packaging/build-deb.sh`):
 | `VERSION` | `/usr/lib/vpn-kill-switch/VERSION` | 0644 |
 | `packaging/sudoers` | `/etc/sudoers.d/vpn-kill-switch` (conffile) | 0440 |
 | `README.md` | `/usr/share/doc/vpn-kill-switch/README.md` | 0644 |
+| `docs/screenshots/*.png` | `/usr/share/doc/vpn-kill-switch/docs/screenshots/` | 0644 |
 | `LICENSE` | `/usr/share/doc/vpn-kill-switch/copyright` | 0644 |
 
 Files created while the kill switch is used (they are not part of the package):
@@ -73,6 +99,25 @@ A VPN has two unpleasant failure modes.
 
 The kill switch covers the second case: even when the default route points
 to Wi-Fi, the rules let nothing out except VPN service packets.
+
+## Status and limitations
+
+- **Tested.** Live on one machine: Ubuntu 24.04, GNOME 46 (Wayland session, the tray runs under XWayland) and an
+  L2TP/IPsec profile (nm-l2tp). The package install, upgrade, remove and purge cycle is tested in a clean
+  Ubuntu 24.04 container. OpenVPN, WireGuard, IKEv2 and PPTP profiles are supported by the code (the extraction of
+  the server address is covered by tests) but have not been run against a real server.
+- **Desktop.** GNOME Shell with the AppIndicator extension is needed for the tray icon (it is enabled by default on
+  Ubuntu). Other desktops are untested.
+- **IPv4 only.** The list of VPN server addresses holds IPv4 addresses. While the kill switch is on, IPv6 traffic
+  leaving through a physical interface is blocked, except link-local (`fe80::/10`, `ff00::/8`).
+- **The kill switch blocks the internet whenever the VPN is down.** To turn it off: tray, `Settings…`, switch
+  `Kill switch` off, `Save`; or, without the tray, `sudo systemctl disable --now vpn-killswitch.service`.
+- **Privileges.** The package lets the members of the `sudo` group run four specific commands without a password
+  (see [what the installation does](#3-what-the-installation-does-and-does-not-do)).
+- **Profiles that ask for a password on every connection** cannot be reconnected by the watchdog unattended: it
+  has no way to enter the password.
+- **Feedback.** Issues are welcome: <https://github.com/localhost1982/vpn-kill-switch/issues>. Please mention the
+  VPN type and the desktop.
 
 ## How it works
 
@@ -270,6 +315,8 @@ The kill switch can only be turned on with a selected VPN profile: without one, 
 
 After a successful save the window closes and the menu shows the chosen profile. Check the result
 as described in "Verification".
+
+To turn the kill switch off again, see [Status and limitations](#status-and-limitations).
 
 ## Verification
 
