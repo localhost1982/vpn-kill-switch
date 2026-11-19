@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# VPN watchdog: keeps the VPN profile selected in the tray Settings connected.
+# VPN watchdog: keeps the NetworkManager VPN profile selected in the tray Settings connected.
 # Installed as /usr/lib/vpn-kill-switch/vpn-watchdog.sh and started by the user unit
 # vpn-watchdog.service (enabled for all users by the package).
 # Every 3 seconds it reads $XDG_CONFIG_HOME/vpn-killswitch/settings.conf (default
@@ -10,6 +10,9 @@
 # file (false/no/0/off; anything else or a missing key means enabled). The tray Settings
 # window has a "Watchdog" switch that writes this setting. While it is off the script
 # only sleeps and does not touch NetworkManager.
+# [vpn] backend = hiddify (default: nm) selects the Hiddify client instead of a
+# NetworkManager profile. Hiddify reconnects by itself, so with that backend the
+# watchdog idles: it brings up neither a NetworkManager profile nor Hiddify.
 # Environment (for tests): VPN_WATCHDOG_DRY_RUN=1 prints the nmcli command instead of
 # running it; VPN_WATCHDOG_ONCE=1 does a single iteration.
 
@@ -48,7 +51,9 @@ while true; do
     case "$ENABLED" in
         false|no|0|off) ;;  # switched off in the tray Settings: nothing to do this time
         *)
-            UUID=$(ini_get vpn uuid | tr -d '[:space:]')
+            BACKEND=$(ini_get vpn backend | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+            UUID=""
+            [[ "$BACKEND" == hiddify ]] || UUID=$(ini_get vpn uuid | tr -d '[:space:]')
             if [[ -n "$UUID" ]] && ! nmcli -t -f UUID connection show --active 2>/dev/null | grep -Fxq "$UUID"; then
                 echo "watchdog: bringing up $UUID" >&2
                 if [[ "${VPN_WATCHDOG_DRY_RUN:-}" == 1 ]]; then

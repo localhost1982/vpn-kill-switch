@@ -11,7 +11,15 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/nftables.d/killswitch.nft
+# The table is loaded with an empty vpn_allow chain; apply fills it from
+# /etc/vpn-killswitch (no DNS lookups, so it works at early boot).
+# The leading "-" matters: if filling vpn_allow fails, the unit must stay up with
+# the table loaded (empty vpn_allow = everything outside the tunnel is blocked).
+# Without it systemd would treat the start as failed and run ExecStop, which
+# deletes the table and opens the internet.
+ExecStartPost=-/usr/sbin/vpn-killswitch-server apply
 ExecReload=/usr/sbin/nft -f /etc/nftables.d/killswitch.nft
+ExecReload=-/usr/sbin/vpn-killswitch-server apply
 ExecStop=/usr/sbin/nft delete table inet killswitch
 
 [Install]

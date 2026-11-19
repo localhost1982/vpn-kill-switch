@@ -6,13 +6,32 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-19
+
 ### Added
 
+- **Hiddify backend.** The tray Settings window can select `Hiddify` (its VPN mode, the system service
+  `HiddifyAdminBG.service`) instead of a NetworkManager profile. The tray state, the "VPN drops" window,
+  the statistics and the watchdog follow the Hiddify tunnel. The settings file gets `[vpn] backend`
+  (`nm` or `hiddify`) and the optional `[hiddify] interface` (default `tun0`).
+- `vpn-killswitch-hiddify.service`: refreshes the kill switch rule for the Hiddify service each time the
+  service starts.
+- `vpn-stats --hiddify`, the `Kill switch mode` row of its "Now" table and the Hiddify labels of `--events`.
+- A test suite in `tests/` (not installed).
 - `CHANGELOG.md`.
 - Screenshots and a "Status and limitations" section in the README.
 
 ### Changed
 
+- The VPN server addresses are no longer written to a generated file
+  (`/etc/nftables.d/killswitch-server.nft`). The kill switch has an empty chain `vpn_allow`, which
+  `vpn-killswitch-server` fills at runtime (`set`, `set-hiddify`, `apply`, `refresh`, `show`); the state is kept
+  in `/etc/vpn-killswitch/` (`mode`, `servers`, `addresses`).
+- The kill switch loads even when nothing is configured. With an empty `vpn_allow` chain, everything outside the
+  tunnel interfaces is blocked, except the local network.
+- The watchdog idles with the Hiddify backend: Hiddify reconnects by itself.
+- Upgrading from 1.0.x is automatic: the addresses of the old generated file are moved to
+  `/etc/vpn-killswitch/addresses`, the mode becomes `servers`, the old file is removed and the rules are reloaded.
 - The package also installs the screenshots and the changelog next to the README in
   `/usr/share/doc/vpn-kill-switch/`.
 
@@ -43,5 +62,6 @@ First packaged release:
 - **Debian package** `vpn-kill-switch`: dependencies, systemd units, passwordless rights for
   the `sudo` group for four specific commands, migration from an earlier source install.
 
-[Unreleased]: https://github.com/localhost1982/vpn-kill-switch/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/localhost1982/vpn-kill-switch/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/localhost1982/vpn-kill-switch/releases/tag/v1.1.0
 [1.0.0]: https://github.com/localhost1982/vpn-kill-switch/releases/tag/v1.0.0

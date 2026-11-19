@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+1000.000000 host kernel: Linux version 6.14.0
+1010.100000 host NetworkManager[1]: <info>  [1010.1000] device (tun0): state change: secondaries -> activated (reason 'none', sys-iface-state: 'external')
+1010.300000 host NetworkManager[1]: <info>  [1010.3000] device (tun0): state change: activated -> unmanaged (reason 'unmanaged', sys-iface-state: 'removed')
+1010.500000 host NetworkManager[1]: <info>  [1010.5000] device (tun0): state change: secondaries -> activated (reason 'none', sys-iface-state: 'external')
+2000.000000 host HiddifyCli[2]: 2026/11/19 22:27:59 [timing] stop: core is stopped after 49ms
+2000.000050 host HiddifyCli[2]: 22:27:59.671 [timing] stop: core is stopped after 49ms
+2000.200000 host NetworkManager[1]: <info>  [2000.2000] device (tun0): state change: activated -> unmanaged (reason 'unmanaged', sys-iface-state: 'removed')
+2030.000000 host NetworkManager[1]: <info>  [2030.0000] device (tun0): state change: secondaries -> activated (reason 'none', sys-iface-state: 'external')
+3000.000000 host kernel: PM: suspend entry (deep)
+3001.000000 host NetworkManager[1]: <info>  [3001.0000] device (tun0): state change: activated -> unmanaged (reason 'unmanaged', sys-iface-state: 'removed')
+3601.000000 host kernel: PM: suspend exit
+3611.000000 host NetworkManager[1]: <info>  [3611.0000] device (tun0): state change: secondaries -> activated (reason 'none', sys-iface-state: 'external')
+4000.000000 host NetworkManager[1]: <info>  [4000.0000] device (tun0): state change: activated -> unmanaged (reason 'unmanaged', sys-iface-state: 'removed')
+4000.500000 host NetworkManager[1]: <info>  [4000.5000] device (tun0): state change: activated -> unmanaged (reason 'unmanaged', sys-iface-state: 'removed')
+4005.000000 host HiddifyCli[2]: adminbg: hcore.Start took 12ms (err=connection refused)
+4050.000000 host NetworkManager[1]: <info>  [4050.0000] device (tun0): state change: secondaries -> activated (reason 'none', sys-iface-state: 'external')
+5000.000000 host NetworkManager[1]: <info>  [5000.0000] device (wlan0): state change: activated -> unmanaged (reason 'unmanaged', sys-iface-state: 'removed')
+5100.000000 host NetworkManager[1]: <info>  [5100.0000] device (tun0): state change: activated -> unmanaged (reason 'unmanaged', sys-iface-state: 'removed')

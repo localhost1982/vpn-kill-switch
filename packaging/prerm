@@ -19,6 +19,7 @@ if [ -d /run/systemd/system ]; then
     systemctl --global disable vpn-tray.service vpn-watchdog.service >/dev/null 2>&1 || true
     # ExecStop deletes the nftables table.
     systemctl disable --now vpn-killswitch.service >/dev/null 2>&1 || true
+    systemctl disable --now vpn-killswitch-hiddify.service >/dev/null 2>&1 || true
 fi
 
 exit 0

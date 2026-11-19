@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Used only in the Hiddify mode of the kill switch; enabled and disabled by
+# `vpn-killswitch-server set-hiddify` / `set`, not by the package.
+#
+# The kill switch allows the traffic of HiddifyAdminBG.service by its cgroup
+# id, and that id changes on every start of the Hiddify service. This unit
+# reloads the rule each time Hiddify starts: it is wanted by the Hiddify
+# service, and PartOf= makes it restart together with it.
+[Unit]
+Description=VPN kill switch: allow the Hiddify service (refreshes the rule when Hiddify starts)
+After=HiddifyAdminBG.service vpn-killswitch.service
+PartOf=HiddifyAdminBG.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/vpn-killswitch-server apply
+
+[Install]
+WantedBy=HiddifyAdminBG.service

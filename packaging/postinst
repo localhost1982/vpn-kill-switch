@@ -8,6 +8,23 @@ UNITS="vpn-tray.service vpn-watchdog.service"
 FRESH=
 [ -n "$2" ] || FRESH=1
 
+# Migration from 1.0.x: the server addresses lived in a generated nft file;
+# they now live in /etc/vpn-killswitch/addresses and the chain vpn_allow.
+OLD_SERVER_NFT=/etc/nftables.d/killswitch-server.nft
+CONF_DIR=/etc/vpn-killswitch
+if [ -f "$OLD_SERVER_NFT" ]; then
+    mkdir -p "$CONF_DIR"
+    grep '^define vpn_servers' "$OLD_SERVER_NFT" | sed 's/^[^{]*{//; s/}.*//' | tr ',' '\n' |
+        tr -d ' \t\r' |
+        grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' |
+        awk -F. '$1<=255 && $2<=255 && $3<=255 && $4<=255 && !seen[$0]++' >"$CONF_DIR/addresses.tmp" || true
+    chmod 0644 "$CONF_DIR/addresses.tmp"
+    mv -f "$CONF_DIR/addresses.tmp" "$CONF_DIR/addresses"
+    [ -e "$CONF_DIR/mode" ] || echo servers >"$CONF_DIR/mode"
+    rm -f "$OLD_SERVER_NFT"
+    echo "vpn-kill-switch: migrated the VPN server addresses to $CONF_DIR"
+fi
+
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true
     if [ -e /run/vpn-kill-switch.was-enabled ]; then
@@ -15,7 +32,8 @@ if [ -d /run/systemd/system ]; then
         rm -f /run/vpn-kill-switch.was-enabled
     fi
     # Apply the packaged rules atomically, only when the kill switch is on
-    # (then the generated server file exists).
+    # (the reload recreates the table; ExecReload then runs
+    # vpn-killswitch-server apply to fill the vpn_allow chain).
     if systemctl is-active --quiet vpn-killswitch.service; then
         systemctl reload vpn-killswitch.service || true
     fi

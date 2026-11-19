@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT
+100.000000 host kernel: Linux version 6.14.0
+110.000000 host NetworkManager[900]: <info>  [110.0000] vpn[0x5581,"aaaaaaaa-1111-2222-3333-444444444444","My VPN"]: starting l2tp
+120.000000 host NetworkManager[900]: <info>  [120.0000] policy: set 'My VPN' (ppp0) as default for IPv4 routing and DNS
+600.000000 host xl2tpd[800]: message=recv message_type=avpMsgTypeHello
+700.000000 host NetworkManager[900]: <info>  [700.0000] vpn[0x5581,"aaaaaaaa-1111-2222-3333-444444444444","Other VPN"]: starting l2tp
+710.000000 host NetworkManager[900]: <info>  [710.0000] policy: set 'Other VPN' (tun1) as default for IPv4 routing and DNS
+720.000000 host NetworkManager[900]: <info>  [720.0000] vpn[0x5581,"aaaaaaaa-1111-2222-3333-444444444444","Other VPN"]: failed to connect: 'Connect timeout'
+1000.000000 host pppd[11]: No response to 4 echo-requests
+1000.500000 host pppd[11]: Connection terminated.
+1010.000000 host NetworkManager[900]: <info>  [1010.0000] vpn[0x5581,"aaaaaaaa-1111-2222-3333-444444444444","My VPN"]: starting l2tp
+1025.000000 host NetworkManager[900]: <info>  [1025.0000] policy: set 'My VPN' (ppp0) as default for IPv4 routing and DNS
+2000.000000 host pppd[12]: Terminating on signal 15
+2000.200000 host pppd[12]: Connection terminated.
+2030.000000 host NetworkManager[900]: <info>  [2030.0000] policy: set 'My VPN' (ppp0) as default for IPv4 routing and DNS
+3000.000000 host kernel: PM: suspend entry (deep)
+3002.000000 host pppd[13]: Terminating on signal 15
+3002.300000 host pppd[13]: Connection terminated.
+3300.000000 host kernel: PM: suspend exit
+3310.000000 host NetworkManager[900]: <info>  [3310.0000] policy: set 'My VPN' (ppp0) as default for IPv4 routing and DNS
+3400.000000 host systemd[1]: Stopped NetworkManager.service - Network Manager.
+4000.000000 host pppd[14]: Connection terminated.
+4010.000000 host NetworkManager[900]: <info>  [4010.0000] vpn[0x5581,"aaaaaaaa-1111-2222-3333-444444444444","My VPN"]: starting l2tp
+4040.000000 host NetworkManager[900]: <info>  [4040.0000] vpn[0x5581,"aaaaaaaa-1111-2222-3333-444444444444","My VPN"]: failed to connect: 'Connect timeout'
+4050.000000 host NetworkManager[900]: <info>  [4050.0000] vpn[0x5581,"aaaaaaaa-1111-2222-3333-444444444444","My VPN"]: starting l2tp
+4055.000000 host NetworkManager[900]: <info>  [4055.0000] secrets: failed to request VPN secrets #3: No agents were available for this request.
+4100.000000 host NetworkManager[900]: <info>  [4100.0000] vpn[0x5581,"aaaaaaaa-1111-2222-3333-444444444444","My VPN"]: starting l2tp
+4120.000000 host NetworkManager[900]: <info>  [4120.0000] policy: set 'My VPN' (ppp0) as default for IPv4 routing and DNS
+4500.000000 host xl2tpd[800]: message=recv message_type=avpMsgTypeHello
+4600.000000 host NetworkManager[900]: <info>  [4600.0000] device (wlan0): state change: activated -> disconnected (reason 'ssid-not-found', sys-iface-state: 'managed')
+4601.000000 host NetworkManager[900]: <info>  [4601.0000] device (wlan0): state change: secondaries -> failed (reason 'secondary-connection-failed', sys-iface-state: 'managed')
+5000.000000 host pppd[15]: Terminating on signal 15
+5000.200000 host pppd[15]: Connection terminated.
+5010.000000 host pppd[16]: No response to 4 echo-requests
+5010.200000 host pppd[16]: Connection terminated.

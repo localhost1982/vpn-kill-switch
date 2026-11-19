@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # VPN drop and internet-loss statistics for the last N hours.
-# The VPN profile comes from the tray Settings file (or --vpn NAME).
+# Two backends: a NetworkManager VPN profile (default) or Hiddify (sing-box based
+# client whose tunnel is brought up by the root service HiddifyAdminBG.service).
+# The backend comes from [vpn] backend in the tray Settings file (nm|hiddify, default
+# nm); --hiddify and --vpn NAME override it. For a NetworkManager profile the profile
+# is [vpn] uuid (or --vpn NAME). For Hiddify the interface is [hiddify] interface
+# (default tun0); drops are derived from NetworkManager state changes of that
+# interface, the Hiddify service log and kernel suspend lines (causes: on command,
+# suspend, other; coarser than the pppd-based causes of the NetworkManager backend).
 # Data source: the systemd journal (journalctl). Output: Markdown tables.
 # Installed as /usr/bin/vpn-stats; from a git checkout run it as ./vpn-stats.sh.
-# Usage: vpn-stats [hours] [--events] [--vpn NAME]   (details: vpn-stats --help)
+# Usage: vpn-stats [hours] [--events] [--vpn NAME | --hiddify]   (details: vpn-stats --help)
+#
+# Hidden testing aids (environment, not documented in --help):
+#   VPN_STATS_JOURNAL_FILE  read this file (journalctl -o short-unix format) instead of
+#                           calling journalctl
+#   VPN_STATS_NOW           epoch overriding "now"
+#   VPN_STATS_CONNECTED     1/0 overriding the "VPN connected right now" check
 
 set -euo pipefail
 
@@ -33,17 +46,23 @@ export RE_HELLO="message=recv message_type=avpMsgTypeHello"
 usage() {
     local me=${0##*/}
     cat <<USAGE
-Usage: $me [hours] [--events] [--vpn NAME] [-h|--help]
+Usage: $me [hours] [--events] [--vpn NAME | --hiddify] [-h|--help]
 
 VPN drop and internet-loss statistics for the last N hours
 (Markdown tables, data source: the systemd journal).
 The package installs this script as "vpn-stats".
 
-The VPN profile is the one selected in the tray Settings window, stored in
-\${XDG_CONFIG_HOME:-~/.config}/vpn-killswitch/settings.conf ([vpn] uuid = ...).
-Use --vpn NAME to look at another profile instead (e.g. its history).
-Drop causes (LCP, on command, other) are detected for pppd-based profiles
-(L2TP, PPTP); for other VPN types only connection events are counted.
+Two backends are supported, selected in the tray Settings window and stored in
+\${XDG_CONFIG_HOME:-~/.config}/vpn-killswitch/settings.conf ([vpn] backend = nm|hiddify,
+default nm):
+  nm       a NetworkManager VPN profile ([vpn] uuid = ...). Drop causes (LCP, on
+           command, other) are detected for pppd-based profiles (L2TP, PPTP); for
+           other VPN types only connection events are counted.
+  hiddify  the Hiddify client (tunnel interface [hiddify] interface, default tun0).
+           Drops come from the tunnel state in NetworkManager and the Hiddify service
+           log. Causes are coarser: on command (Hiddify stopped), suspend, other.
+           The rows "server stopped responding (LCP)", "Password request errors" and
+           "Hello from L2TP server" exist only for the nm backend.
 
   hours      period in hours, default 1. Both a decimal point and a decimal comma
              are accepted (1.5, 1,5). Step is 0.5 h: the value is rounded
@@ -51,7 +70,8 @@ Drop causes (LCP, on command, other) are detected for pppd-based profiles
              1.3 -> 1.5). If the result after rounding is 0 or the value is not
              a number, 1 h is used.
   --vpn NAME use the NetworkManager VPN profile NAME instead of the one from the
-             settings file
+             settings file (forces the nm backend)
+  --hiddify  show the Hiddify backend (forces it; cannot be combined with --vpn)
   --events   after the tables, print a chronology of events (connections, drops,
              suspends, NetworkManager restarts, boots, connection failures)
   -h, --help show this help
@@ -62,6 +82,7 @@ Examples:
   $me 1,5        # an hour and a half
   $me 3 --events # three hours with the chronology
   $me 6 --vpn "Work VPN"  # another profile
+  $me 6 --hiddify         # Hiddify statistics
 
 sudo is not needed, except for the row with the kill switch blocked-packet counter:
 without passwordless sudo it will show "n/a (sudo required)". The script never asks for a password.
@@ -184,6 +205,32 @@ vpn_active() {
         list=$(nmcli -t -f NAME connection show --active 2>/dev/null || true)
         grep -Fxq -- "$VPN_NAME" <<<"$list"
     fi
+}
+
+# Whether the Hiddify tunnel is connected right now (0 = yes): NetworkManager reports
+# the interface as connected; without an answer from nmcli the interface must exist.
+hiddify_active() {
+    local line
+    if [[ -n ${VPN_STATS_CONNECTED:-} ]]; then
+        [[ $VPN_STATS_CONNECTED == 1 ]]
+        return
+    fi
+    line=$(nmcli -t -f DEVICE,STATE device 2>/dev/null | grep -F -- "${HID_IFACE}:" | head -n1 || true)
+    if [[ -n $line ]]; then
+        [[ ${line#*:} == connected* ]]
+    else
+        ip link show "$HID_IFACE" >/dev/null 2>&1
+    fi
+}
+
+# Kill switch mode from /etc/vpn-killswitch/mode: hiddify / servers / not configured.
+killswitch_mode() {
+    local m=""
+    [[ -r /etc/vpn-killswitch/mode ]] && m=$(head -n1 /etc/vpn-killswitch/mode 2>/dev/null | tr -d '[:space:]' || true)
+    case $m in
+        hiddify|servers) echo "$m" ;;
+        *)               echo "not configured" ;;
+    esac
 }
 
 # systemd unit state -> "active" / "inactive" / "unavailable" (if there is no answer).
@@ -320,9 +367,139 @@ END {
 }
 AWK
 
+# --- awk: Hiddify events -------------------------------------------------------
+# Input: the journal in short-unix format. Output: tab-separated lines:
+#   E <epoch> <description>   event for the --events mode
+#   D <epoch> <cause>         drop (command / suspend / other)
+#   G <total> <max> <from> <to>  outages: total, longest (seconds) and its bounds
+#   S <drops> <command> <suspend> <other> <successes> <failures>
+# Parameters: -v now=<epoch> -v active=<0|1>; environment: HID_IFACE and RE_*.
+# Rules: marker de-duplication (1.0 s), flap debounce (1.5 s), state machine.
+read -r -d '' AWK_HIDDIFY <<'AWK' || true
+function add(t, kind) { n++; T[n] = t; K[n] = kind }
+# Seconds of [a, b] spent suspended.
+function susp(a, b,   i, lo, hi, s) {
+    s = 0
+    for (i = 1; i <= nsi; i++) {
+        lo = (SS[i] > a) ? SS[i] : a
+        hi = (SW[i] < b) ? SW[i] : b
+        if (hi > lo) s += hi - lo
+    }
+    return s
+}
+function close_gap(dur, from, to) {
+    if (dur < 0) dur = 0
+    total += dur
+    if (dur > longest) { longest = dur; lstart = from; lend = to }
+}
+BEGIN {
+    iface = ENVIRON["HID_IFACE"]
+    needle = "device (" iface "): state change: "
+    re_sleep = ENVIRON["RE_SLEEP"]; re_wake = ENVIRON["RE_WAKE"]
+    re_nm = ENVIRON["RE_NM_STOP"];  re_boot = ENVIRON["RE_BOOT"]
+}
+{
+    t = $1 + 0
+    pos = index($0, needle)
+    if (pos > 0 && $0 ~ /NetworkManager\[/) {
+        rest = substr($0, pos + length(needle))
+        if (rest ~ /^activated -> /) add(t, "DOWN")
+        else if (rest ~ /^[^ ]+ -> activated( |$)/) add(t, "UP")
+    }
+    else if (index($0, "[timing] stop: core is stopped") > 0) add(t, "STOP")
+    else if (index($0, "hcore.Start took") > 0 && index($0, "err=<nil>") == 0) add(t, "FAILSTART")
+    else if ($0 ~ re_sleep) add(t, "SLEEP")
+    else if ($0 ~ re_wake)  add(t, "WAKE")
+    else if ($0 ~ re_nm)    add(t, "NMSTOP")
+    else if ($0 ~ re_boot)  add(t, "BOOT")
+}
+END {
+    # Stable insertion sort by time (the journal is normally already sorted).
+    for (i = 1; i <= n; i++) {
+        t = T[i]; k = K[i]
+        for (j = i - 1; j >= 1 && T[j] > t; j--) { T[j + 1] = T[j]; K[j + 1] = K[j] }
+        T[j + 1] = t; K[j + 1] = k
+    }
+
+    # 1. De-duplicate STOP / FAILSTART markers (< 1.0 s after the previous one of the kind).
+    for (i = 1; i <= n; i++) {
+        k = K[i]; dead[i] = 0
+        if (k == "STOP" || k == "FAILSTART") {
+            if ((k in lastm) && T[i] - lastm[k] < 1.0) dead[i] = 1
+            lastm[k] = T[i]
+        }
+    }
+
+    # 2. Debounce tunnel flaps: DOWN directly followed by UP less than 1.5 s later.
+    m = 0
+    for (i = 1; i <= n; i++) if (!dead[i] && (K[i] == "UP" || K[i] == "DOWN")) U[++m] = i
+    for (j = 1; j <= m; j++) {
+        if (K[U[j]] == "DOWN" && j < m && K[U[j + 1]] == "UP" && T[U[j + 1]] - T[U[j]] < 1.5) {
+            dead[U[j]] = 1; dead[U[j + 1]] = 1; j++
+        }
+    }
+
+    # Suspended intervals (SLEEP .. following WAKE; unfinished one lasts to the end).
+    nsi = 0; asleep = 0
+    for (i = 1; i <= n; i++) {
+        if (K[i] == "SLEEP" && !asleep) { asleep = 1; s0 = T[i] }
+        else if (K[i] == "WAKE" && asleep) { asleep = 0; nsi++; SS[nsi] = s0; SW[nsi] = T[i] }
+    }
+    if (asleep) { nsi++; SS[nsi] = s0; SW[nsi] = 1e18 }
+
+    # 3. State machine.
+    state = "unknown"; open = 0; total = 0; longest = 0; lstart = 0; lend = 0
+    drops = 0; ncmd = 0; nsus = 0; noth = 0; succ = 0; fail = 0
+    for (i = 1; i <= n; i++) {
+        if (dead[i]) continue
+        k = K[i]; t = T[i]; txt = ""
+        if (k == "UP") {
+            if (state != "up") {
+                txt = "Hiddify connected"; succ++
+                if (open) { close_gap(t - os - susp(os, t), os, t); open = 0 }
+                state = "up"
+            }
+        } else if (k == "DOWN") {
+            if (state != "down") {
+                cause = "other"
+                for (j = 1; j <= n; j++) {
+                    if (K[j] == "STOP" && !dead[j]) { d = t - T[j]; if (d < 0) d = -d; if (d <= 5) { cause = "command"; break } }
+                }
+                if (cause == "other") {
+                    for (j = 1; j <= n; j++) {
+                        if (K[j] == "SLEEP") { d = t - T[j]; if (d < 0) d = -d; if (d <= 5) { cause = "suspend"; break } }
+                    }
+                }
+                if (cause == "other") {
+                    for (j = 1; j <= nsi; j++) if (t >= SS[j] && t <= SW[j]) { cause = "suspend"; break }
+                }
+                drops++
+                if (cause == "command") { ncmd++; txt = "Hiddify drop: on command" }
+                else if (cause == "suspend") { nsus++; txt = "Hiddify drop: suspend" }
+                else { noth++; txt = "Hiddify drop: other" }
+                printf "D\t%.0f\t%s\n", int(t), cause
+                open = 1; os = t; state = "down"
+            }
+        } else if (k == "FAILSTART") { txt = "Hiddify failed to start"; fail++ }
+        else if (k == "SLEEP") txt = "suspend"
+        else if (k == "WAKE") txt = "wake"
+        else if (k == "NMSTOP") txt = "NetworkManager restart"
+        else if (k == "BOOT") { txt = "system boot"; open = 0; state = "down" }
+        if (txt != "") printf "E\t%.0f\t%s\n", int(t), txt
+    }
+
+    # 4. An unclosed outage counts only if the tunnel is not connected now.
+    if (open && !active) close_gap(now - os - susp(os, now), os, now)
+
+    printf "G\t%.0f\t%.0f\t%.0f\t%.0f\n", total, longest, lstart, lend
+    printf "S\t%d\t%d\t%d\t%d\t%d\t%d\n", drops, ncmd, nsus, noth, succ, fail
+}
+AWK
+
 # --- Main code ----------------------------------------------------------------
 SHOW_EVENTS=0
 VPN_NAME_ARG=""
+HIDDIFY_ARG=0
 ARG_HOURS=""
 HAVE_ARG=0
 
@@ -330,6 +507,7 @@ while (( $# > 0 )); do
     case $1 in
         -h|--help) usage; exit 0 ;;
         --events)  SHOW_EVENTS=1 ;;
+        --hiddify) HIDDIFY_ARG=1 ;;
         --vpn)
             if (( $# < 2 )) || [[ -z $2 ]]; then
                 echo "Option --vpn requires a profile name" >&2
@@ -363,14 +541,44 @@ else
 fi
 MINUTES=$((HALFHOURS * 30))
 
-resolve_vpn
-build_name_patterns
+if (( HIDDIFY_ARG )) && [[ -n $VPN_NAME_ARG ]]; then
+    echo "Options --hiddify and --vpn cannot be used together" >&2
+    usage >&2
+    exit 2
+fi
+
+# Backend: --hiddify / --vpn force one; otherwise [vpn] backend from the settings file.
+if (( HIDDIFY_ARG )); then
+    BACKEND=hiddify
+elif [[ -n $VPN_NAME_ARG ]]; then
+    BACKEND=nm
+else
+    BACKEND=$(ini_get vpn backend | tr '[:upper:]' '[:lower:]')
+    BACKEND=${BACKEND%%[[:space:]#]*}
+    [[ $BACKEND == hiddify ]] || BACKEND=nm
+fi
+
+if [[ $BACKEND == hiddify ]]; then
+    HID_IFACE=$(ini_get hiddify interface)
+    HID_IFACE=${HID_IFACE%%[[:space:]#]*}
+    : "${HID_IFACE:=tun0}"
+    export HID_IFACE
+    VPN_NAME="Hiddify"
+else
+    resolve_vpn
+    build_name_patterns
+fi
 
 JOURNAL=$(mktemp)
 trap 'rm -f "$JOURNAL"' EXIT
 
-NOW=$(date +%s)
-if ! journalctl --since "-${MINUTES}min" -o short-unix --no-pager -q >"$JOURNAL" 2>/dev/null; then
+NOW=${VPN_STATS_NOW:-$(date +%s)}
+if [[ -n ${VPN_STATS_JOURNAL_FILE:-} ]]; then
+    if ! cp -- "$VPN_STATS_JOURNAL_FILE" "$JOURNAL" 2>/dev/null; then
+        echo "Failed to read the journal file." >&2
+        exit 1
+    fi
+elif ! journalctl --since "-${MINUTES}min" -o short-unix --no-pager -q >"$JOURNAL" 2>/dev/null; then
     echo "Failed to read the journal (journalctl)." >&2
     exit 1
 fi
@@ -382,22 +590,35 @@ else
     PERIOD="$(fmt_datetime "$START") – $(fmt_datetime "$NOW")"
 fi
 
-if vpn_active; then VPN_ACTIVE=1; else VPN_ACTIVE=0; fi
+if [[ $BACKEND == hiddify ]]; then
+    if hiddify_active; then VPN_ACTIVE=1; else VPN_ACTIVE=0; fi
+elif [[ -n ${VPN_STATS_CONNECTED:-} ]]; then
+    VPN_ACTIVE=$VPN_STATS_CONNECTED
+elif vpn_active; then VPN_ACTIVE=1; else VPN_ACTIVE=0; fi
 
 # Parse the journal with awk: events, drops, outages.
-RESULT=$(awk -v now="$NOW" -v active="$VPN_ACTIVE" "$AWK_PROG" "$JOURNAL")
+if [[ $BACKEND == hiddify ]]; then
+    RESULT=$(awk -v now="$NOW" -v active="$VPN_ACTIVE" "$AWK_HIDDIFY" "$JOURNAL")
+else
+    RESULT=$(awk -v now="$NOW" -v active="$VPN_ACTIVE" "$AWK_PROG" "$JOURNAL")
+fi
 
 # Counters.
-LCP=$(count "$RE_LCP")
-SIGNAL=$(count "$RE_TERM")
-CONN=$(count "$RE_CONN")
-TOTAL=$(( CONN > LCP + SIGNAL ? CONN : LCP + SIGNAL ))
-OTHER=$((TOTAL - LCP - SIGNAL))
-STARTS=$(count "$RE_START")
-OKS=$(count "$RE_UP")
-FAILS=$(count "$RE_FAIL")
-NOAGENTS=$(count "$RE_NOAGENT")
-HELLOS=$(count "$RE_HELLO")
+if [[ $BACKEND == nm ]]; then
+    LCP=$(count "$RE_LCP")
+    SIGNAL=$(count "$RE_TERM")
+    CONN=$(count "$RE_CONN")
+    TOTAL=$(( CONN > LCP + SIGNAL ? CONN : LCP + SIGNAL ))
+    OTHER=$((TOTAL - LCP - SIGNAL))
+    STARTS=$(count "$RE_START")
+    OKS=$(count "$RE_UP")
+    FAILS=$(count "$RE_FAIL")
+    NOAGENTS=$(count "$RE_NOAGENT")
+    HELLOS=$(count "$RE_HELLO")
+else
+    IFS=$'\t' read -r _ TOTAL SIGNAL HID_SUSPEND OTHER OKS FAILS < <(awk -F'\t' '$1 == "S"' <<<"$RESULT")
+    STARTS=$((OKS + FAILS))
+fi
 WIFI_DOWN=$(count "$RE_WIFI_DOWN")
 WIFI_RESET=$(count "$RE_WIFI_RESET")
 SLEEPS=$(count "$RE_SLEEP")
@@ -413,10 +634,12 @@ if (( DOWN_MAX > 0 )); then
 fi
 
 # The last Hello from the server.
-HELLO_TXT="$HELLOS"
-if (( HELLOS > 0 )); then
-    LAST_HELLO=$(grep -E -- "$RE_HELLO" "$JOURNAL" | tail -n1 | cut -d' ' -f1 || true)
-    HELLO_TXT+=" (last $(fmt_time "${LAST_HELLO%%.*}"))"
+if [[ $BACKEND == nm ]]; then
+    HELLO_TXT="$HELLOS"
+    if (( HELLOS > 0 )); then
+        LAST_HELLO=$(grep -E -- "$RE_HELLO" "$JOURNAL" | tail -n1 | cut -d' ' -f1 || true)
+        HELLO_TXT+=" (last $(fmt_time "${LAST_HELLO%%.*}"))"
+    fi
 fi
 
 # The last 5 drops, newest first.
@@ -438,17 +661,27 @@ echo "### Statistics"
 echo
 echo "| Metric | Value |"
 echo "|---|---:|"
-echo "| VPN drops, total | $TOTAL |"
-echo "|   • server stopped responding (LCP) | $LCP |"
-echo "|   • on command: sleep, nmcli down | $SIGNAL |"
-echo "|   • other | $OTHER |"
-echo "| VPN connection attempts | $STARTS |"
-echo "| Successful connections | $OKS |"
-echo "| Failed connections (timeout) | $FAILS |"
-echo "| Password request errors (no agent) | $NOAGENTS |"
+if [[ $BACKEND == nm ]]; then
+    echo "| VPN drops, total | $TOTAL |"
+    echo "|   • server stopped responding (LCP) | $LCP |"
+    echo "|   • on command: sleep, nmcli down | $SIGNAL |"
+    echo "|   • other | $OTHER |"
+    echo "| VPN connection attempts | $STARTS |"
+    echo "| Successful connections | $OKS |"
+    echo "| Failed connections (timeout) | $FAILS |"
+    echo "| Password request errors (no agent) | $NOAGENTS |"
+else
+    echo "| VPN drops, total | $TOTAL |"
+    echo "|   • on command (Hiddify stopped) | $SIGNAL |"
+    echo "|   • suspend | $HID_SUSPEND |"
+    echo "|   • other | $OTHER |"
+    echo "| VPN connection attempts | $STARTS |"
+    echo "| Successful connections | $OKS |"
+    echo "| Failed connections (Hiddify core failed to start) | $FAILS |"
+fi
 echo "| Total time without VPN | $DOWN_TOTAL_TXT |"
 echo "| Longest outage | $DOWN_MAX_TXT |"
-echo "| Hello from L2TP server | $HELLO_TXT |"
+[[ $BACKEND == hiddify ]] || echo "| Hello from L2TP server | $HELLO_TXT |"
 echo "| Wi-Fi: disconnects | $WIFI_DOWN |"
 echo "| Wi-Fi: resets after VPN failure | $WIFI_RESET |"
 echo "| Suspends | $SLEEPS |"
@@ -464,10 +697,15 @@ echo "| Metric | Value |"
 echo "|---|---:|"
 echo "| $VPN_NAME | $VPN_NOW |"
 echo "| Kill switch (vpn-killswitch.service) | $(unit_state systemctl is-active vpn-killswitch.service) |"
-case $(ini_get watchdog enabled | tr '[:upper:]' '[:lower:]') in
-    false|no|0|off) WATCHDOG_NOW="disabled in settings" ;;
-    *)              WATCHDOG_NOW=$(unit_state systemctl --user is-active vpn-watchdog.service) ;;
-esac
+echo "| Kill switch mode | $(killswitch_mode) |"
+if [[ $BACKEND == hiddify ]]; then
+    WATCHDOG_NOW="not used with Hiddify"
+else
+    case $(ini_get watchdog enabled | tr '[:upper:]' '[:lower:]') in
+        false|no|0|off) WATCHDOG_NOW="disabled in settings" ;;
+        *)              WATCHDOG_NOW=$(unit_state systemctl --user is-active vpn-watchdog.service) ;;
+    esac
+fi
 echo "| Watchdog (vpn-watchdog.service) | $WATCHDOG_NOW |"
 echo "| Blocked by kill switch, packets | $(killswitch_drops) |"
 
