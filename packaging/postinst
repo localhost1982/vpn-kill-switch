@@ -37,6 +37,10 @@ if [ -d /run/systemd/system ]; then
     if systemctl is-active --quiet vpn-killswitch.service; then
         systemctl reload vpn-killswitch.service || true
     fi
+    # The routing exception for the VPN server addresses is independent of the
+    # kill switch: keep it enabled and (re)apply it now.
+    systemctl enable vpn-killswitch-apply.service || true
+    systemctl restart vpn-killswitch-apply.service || true
     # shellcheck disable=SC2086
     systemctl --global enable $UNITS >/dev/null 2>&1 || true
 

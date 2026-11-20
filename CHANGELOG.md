@@ -6,6 +6,27 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-20
+
+### Fixed
+
+- `vpn-killswitch-server set` no longer fails when DNS is unavailable and the server list is unchanged: it uses
+  the saved addresses (this made switching from Hiddify back to a VPN profile fail when Save coincided with a
+  network interruption). `refresh` keeps the saved addresses when DNS fails.
+- A VPN profile could not connect while Hiddify was running: its packets were routed into the Hiddify tunnel,
+  which the kill switch blocks in the `servers` mode. The helper now keeps a policy-routing rule
+  (`pref 8999`, `to <server> lookup main`) for every VPN server address.
+
+### Added
+
+- `vpn-killswitch-apply.service`: restores the routing exception at boot, even when the kill switch is disabled.
+- `vpn-killswitch-server clear-routes`: removes the routing rules (used on package removal).
+
+### Changed
+
+- Documentation: the README warns about `connection.secondaries` on Wi-Fi and Ethernet profiles (see
+  "Troubleshooting" and "Hiddify").
+
 ## [1.1.0] - 2026-11-19
 
 ### Added
@@ -62,6 +83,7 @@ First packaged release:
 - **Debian package** `vpn-kill-switch`: dependencies, systemd units, passwordless rights for
   the `sudo` group for four specific commands, migration from an earlier source install.
 
-[Unreleased]: https://github.com/localhost1982/vpn-kill-switch/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/localhost1982/vpn-kill-switch/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/localhost1982/vpn-kill-switch/releases/tag/v1.1.1
 [1.1.0]: https://github.com/localhost1982/vpn-kill-switch/releases/tag/v1.1.0
 [1.0.0]: https://github.com/localhost1982/vpn-kill-switch/releases/tag/v1.0.0

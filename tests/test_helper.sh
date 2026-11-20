@@ -178,6 +178,113 @@ assert_eq "set without hosts: exit status" "$H_RC" 2
 assert_contains "set without hosts: usage" "$H_OUT" "Usage:"
 assert_contains "the state is untouched by all of that" "$(<"$CONF/servers")" "1.2.3.4"
 
+# ---- DNS unavailable: the saved addresses are used (VKS_RESOLVE_FAIL simulates the failure)
+# hs ARGS...: like h, but stdout and stderr are kept apart (H_STDOUT, H_STDERR)
+hs() {
+    local errf=$TEST_TMP/hs-stderr
+    H_STDOUT=$("$HELPER" "$@" 2>"$errf")
+    H_RC=$?
+    H_STDERR=$(<"$errf")
+}
+state() { cat "$CONF/mode" "$CONF/servers" "$CONF/addresses" 2>&1; }
+
+if getent ahosts localhost 2>/dev/null | awk '$2=="STREAM" && $1 ~ /^[0-9.]+$/ {f=1} END {exit !f}'; then
+    # (a) the same host, DNS down: the saved addresses are applied
+    h set localhost
+    assert_contains "dns-fallback (a): the host resolves normally" "$(chain)" "ip daddr 127.0.0.1 accept"
+    VKS_RESOLVE_FAIL=localhost hs set localhost
+    assert_eq "dns-fallback (a): exit status" "$H_RC" 0
+    assert_contains "dns-fallback (a): stderr" "$H_STDERR" "DNS lookup failed for localhost; using the saved addresses."
+    assert_contains "dns-fallback (a): stdout" "$H_STDOUT" "VPN servers: localhost (saved: 127.0.0.1)"
+    assert_contains "dns-fallback (a): the rule is kept" "$(chain)" "ip daddr 127.0.0.1 accept"
+    assert_eq "dns-fallback (a): mode" "$(<"$CONF/mode")" servers
+    assert_eq "dns-fallback (a): hosts file kept" "$(<"$CONF/servers")" localhost
+    assert_eq "dns-fallback (a): addresses file kept" "$(<"$CONF/addresses")" 127.0.0.1
+    assert_eq "dns-fallback (a): no temporary files left" "$(ls -A "$CONF" | sort | tr '\n' ' ')" "addresses mode servers "
+
+    # (b) the bug: back from Hiddify to the same host while DNS is down
+    h set localhost
+    VKS_CGROUP_ROOT=$EMPTY_CG h set-hiddify
+    assert_eq "dns-fallback (b): hiddify mode" "$(<"$CONF/mode")" hiddify
+    assert_eq "dns-fallback (b): servers kept in Hiddify mode" "$(<"$CONF/servers")" localhost
+    assert_eq "dns-fallback (b): addresses kept in Hiddify mode" "$(<"$CONF/addresses")" 127.0.0.1
+    VKS_RESOLVE_FAIL=localhost hs set localhost
+    assert_eq "dns-fallback (b): exit status" "$H_RC" 0
+    assert_eq "dns-fallback (b): mode is back to servers" "$(<"$CONF/mode")" servers
+    assert_contains "dns-fallback (b): the ip rule" "$(chain)" "ip daddr 127.0.0.1 accept"
+    assert_not_contains "dns-fallback (b): no cgroup rule" "$(chain)" "cgroupv2"
+
+    # (e) two hosts, the same set saved in another order, one fails
+    h set 203.0.113.10 localhost
+    assert_eq "dns-fallback (e): two hosts saved" "$(<"$CONF/addresses")" $'203.0.113.10\n127.0.0.1'
+    VKS_RESOLVE_FAIL=localhost hs set localhost 203.0.113.10
+    assert_eq "dns-fallback (e): exit status" "$H_RC" 0
+    assert_contains "dns-fallback (e): stderr" "$H_STDERR" "DNS lookup failed for localhost; using the saved addresses."
+    assert_contains "dns-fallback (e): stdout" "$H_STDOUT" "(saved: 203.0.113.10, 127.0.0.1)"
+    assert_contains "dns-fallback (e): the rule" "$(chain)" "ip daddr { 127.0.0.1, 203.0.113.10 } accept"
+    assert_eq "dns-fallback (e): the saved hosts keep their order" "$(<"$CONF/servers")" $'203.0.113.10\nlocalhost'
+    # a different set (an extra host) is not the saved one
+    before_state=$(state)
+    VKS_RESOLVE_FAIL=localhost hs set localhost 203.0.113.10 198.51.100.7
+    assert_eq "dns-fallback (e): a different set fails" "$H_RC" 3
+    assert_eq "dns-fallback (e): a different set changes nothing" "$(state)" "$before_state"
+
+    # (f) refresh with DNS down keeps the saved addresses
+    h set localhost
+    VKS_RESOLVE_FAIL=localhost hs refresh
+    assert_eq "dns-fallback (f): refresh exit status" "$H_RC" 0
+    assert_contains "dns-fallback (f): refresh stderr" "$H_STDERR" "DNS lookup failed for localhost; keeping the saved addresses."
+    assert_contains "dns-fallback (f): refresh stdout" "$H_STDOUT" "(saved: 127.0.0.1)"
+    assert_contains "dns-fallback (f): refresh keeps the rule" "$(chain)" "ip daddr 127.0.0.1 accept"
+    assert_eq "dns-fallback (f): refresh keeps the addresses" "$(<"$CONF/addresses")" 127.0.0.1
+    # ... but without saved addresses refresh still fails
+    : >"$CONF/addresses"
+    VKS_RESOLVE_FAIL=localhost hs refresh
+    assert_eq "dns-fallback (f): refresh without saved addresses" "$H_RC" 3
+    assert_contains "dns-fallback (f): refresh message" "$H_STDERR" "Cannot resolve localhost"
+    # a damaged address file is not trusted either
+    echo "not-an-ip" >"$CONF/addresses"
+    VKS_RESOLVE_FAIL=localhost hs refresh
+    assert_eq "dns-fallback (f): refresh with damaged addresses" "$H_RC" 3
+
+    # (c) no saved state at all
+    P3=$TEST_TMP/prefix3
+    mkdir -p "$P3"
+    VKS_PREFIX=$P3 VKS_RESOLVE_FAIL=localhost hs set localhost
+    assert_eq "dns-fallback (c): exit status" "$H_RC" 3
+    assert_contains "dns-fallback (c): message" "$H_STDERR" "Cannot resolve localhost"
+    assert_eq "dns-fallback (c): nothing written" "$(ls -A "$P3")" ""
+    # saved hosts but empty addresses: also a failure
+    mkdir -p "$P3/etc/vpn-killswitch"
+    echo localhost >"$P3/etc/vpn-killswitch/servers"
+    VKS_PREFIX=$P3 VKS_RESOLVE_FAIL=localhost hs set localhost
+    assert_eq "dns-fallback (c): saved hosts without addresses" "$H_RC" 3
+    assert_eq "dns-fallback (c): still no mode file" "$(ls -A "$P3/etc/vpn-killswitch")" "servers"
+
+    # (d) the saved host differs from the requested one
+    h set 203.0.113.10
+    before_state=$(state)
+    before=$(chain)
+    VKS_RESOLVE_FAIL=localhost hs set localhost
+    assert_eq "dns-fallback (d): exit status" "$H_RC" 3
+    assert_contains "dns-fallback (d): message" "$H_STDERR" "Cannot resolve localhost"
+    assert_eq "dns-fallback (d): the state is unchanged" "$(state)" "$before_state"
+    assert_eq "dns-fallback (d): the rules are unchanged" "$(chain)" "$before"
+else
+    echo "note: localhost does not resolve here, the DNS fallback cases are not tested"
+fi
+
+# (g) IPv4 literals never need DNS
+VKS_RESOLVE_FAIL="1.2.3.4 localhost anything" hs set 1.2.3.4
+assert_eq "dns-fallback (g): literal with the hook set: exit status" "$H_RC" 0
+assert_eq "dns-fallback (g): literal with the hook set: stderr" "$H_STDERR" ""
+assert_contains "dns-fallback (g): literal with the hook set: summary" "$H_STDOUT" "VPN servers: 1.2.3.4 (1.2.3.4)"
+assert_eq "dns-fallback (g): literal: the address is saved" "$(<"$CONF/addresses")" 1.2.3.4
+VKS_RESOLVE_FAIL=anything hs refresh
+assert_eq "dns-fallback (g): refresh of a literal" "$H_RC" 0
+assert_eq "dns-fallback (g): refresh of a literal: no message" "$H_STDERR" ""
+h set 1.2.3.4 5.6.7.8
+
 # ---- Hiddify mode
 h set-hiddify extra
 assert_eq "set-hiddify with an argument: exit status" "$H_RC" 2
@@ -202,14 +309,14 @@ mkdir -p "$FAKE_CG/system.slice/HiddifyAdminBG.service"
 before=$(chain)
 VKS_DRY_RUN=1 VKS_CGROUP_ROOT=$FAKE_CG h apply
 assert_eq "dry-run apply: exit status" "$H_RC" 0
-assert_eq "dry-run apply: the script" "$H_OUT" "[dry-run] flush chain inet killswitch vpn_allow"$'\n''[dry-run] add rule inet killswitch vpn_allow socket cgroupv2 level 2 "system.slice/HiddifyAdminBG.service" accept comment "Hiddify service"'
+assert_eq "dry-run apply: the script" "$H_OUT" "[dry-run] ip -4 rule del pref 8999"$'\n'"[dry-run] flush chain inet killswitch vpn_allow"$'\n''[dry-run] add rule inet killswitch vpn_allow socket cgroupv2 level 2 "system.slice/HiddifyAdminBG.service" accept comment "Hiddify service"'
 VKS_DRY_RUN=1 VKS_CGROUP_ROOT=$FAKE_CG h set-hiddify
 assert_eq "dry-run set-hiddify: exit status" "$H_RC" 0
 assert_contains "dry-run set-hiddify: the unit that would be enabled" "$H_OUT" "[dry-run] would run: systemctl enable vpn-killswitch-hiddify.service"
 assert_contains "dry-run set-hiddify: the rule" "$H_OUT" 'socket cgroupv2 level 2 "system.slice/HiddifyAdminBG.service" accept'
 assert_contains "dry-run set-hiddify: message" "$H_OUT" "traffic of HiddifyAdminBG.service is allowed"
 VKS_DRY_RUN=1 VKS_CGROUP_ROOT=$EMPTY_CG h apply
-assert_eq "dry-run apply without the cgroup: only the flush" "$H_OUT" "[dry-run] flush chain inet killswitch vpn_allow"
+assert_eq "dry-run apply without the cgroup: only the route cleanup and the flush" "$H_OUT" "[dry-run] ip -4 rule del pref 8999"$'\n'"[dry-run] flush chain inet killswitch vpn_allow"
 VKS_DRY_RUN=1 VKS_CGROUP_ROOT=$FAKE_CG h show
 assert_contains "dry-run show: cgroup present" "$H_OUT" "Service cgroup: present ($FAKE_CG/system.slice/HiddifyAdminBG.service)"
 assert_not_contains "dry-run show: no live rules are listed" "$H_OUT" "Rules (inet killswitch vpn_allow)"
@@ -241,6 +348,110 @@ if [[ -d $REAL_CG ]]; then
 else
     echo "note: $REAL_CG does not exist, the real-cgroup case is not tested"
 fi
+
+# ---- the routing exception (ip -4 rule pref 8999), real rules in the private namespace
+# rrules: the rules with our priority, one per line
+rrules() { ip -4 rule show pref 8999 2>&1; }
+nrules() { ip -4 rule show pref 8999 2>/dev/null | grep -c . || true; }
+load_table
+h clear-routes
+assert_eq "clear-routes: exit status" "$H_RC" 0
+assert_eq "clear-routes: no rules" "$(nrules)" 0
+h clear-routes
+assert_eq "clear-routes with nothing to clear: exit status" "$H_RC" 0
+h clear-routes extra
+assert_eq "clear-routes with an argument: exit status" "$H_RC" 2
+ip -4 rule add pref 9000 to 192.0.2.1 lookup main
+h set 203.0.113.10 198.51.100.7
+assert_eq "routes: set exit status" "$H_RC" 0
+assert_eq "routes: two rules after set" "$(nrules)" 2
+assert_contains "routes: first rule" "$(rrules)" "to 203.0.113.10 lookup main"
+assert_contains "routes: second rule" "$(rrules)" "to 198.51.100.7 lookup main"
+h apply
+h apply
+assert_eq "routes: apply twice, still two rules" "$(nrules)" 2
+h show
+assert_contains "routes: show heading" "$H_OUT" "Routing rules (pref 8999):"
+assert_contains "routes: show lists the rule" "$H_OUT" "to 203.0.113.10 lookup main"
+h set 203.0.113.10
+assert_eq "routes: one rule after set of one address" "$(nrules)" 1
+assert_contains "routes: the remaining rule" "$(rrules)" "to 203.0.113.10 lookup main"
+VKS_CGROUP_ROOT=$EMPTY_CG h set-hiddify
+assert_eq "routes: set-hiddify removes the rules" "$(nrules)" 0
+h show
+assert_contains "routes: show with none" "$H_OUT" $'Routing rules (pref 8999):\n  none'
+h set 203.0.113.10
+assert_eq "routes: back to servers, the rule is back" "$(nrules)" 1
+assert_contains "routes: foreign rule (pref 9000) untouched" "$(ip -4 rule show pref 9000)" "to 192.0.2.1 lookup main"
+h clear-routes
+assert_eq "routes: clear-routes removes the rule" "$(nrules)" 0
+assert_contains "routes: foreign rule still untouched after clear-routes" "$(ip -4 rule show pref 9000)" "to 192.0.2.1 lookup main"
+h apply
+assert_eq "routes: apply recreates the rule after clear-routes" "$(nrules)" 1
+# a dry run prints the commands and changes nothing
+VKS_DRY_RUN=1 h apply
+assert_eq "routes: dry-run apply exit status" "$H_RC" 0
+assert_contains "routes: dry-run delete" "$H_OUT" "[dry-run] ip -4 rule del pref 8999"
+assert_contains "routes: dry-run add" "$H_OUT" "[dry-run] ip -4 rule add pref 8999 to 203.0.113.10/32 lookup main"
+assert_eq "routes: dry-run changed nothing" "$(nrules)" 1
+VKS_DRY_RUN=1 h clear-routes
+assert_contains "routes: dry-run clear-routes" "$H_OUT" "[dry-run] ip -4 rule del pref 8999"
+assert_eq "routes: dry-run clear-routes changed nothing" "$(nrules)" 1
+# a corrupted addresses line does not produce a rule
+printf '203.0.113.10\n999.1.1.1\nnot-an-ip\n' >"$CONF/addresses"
+h apply
+assert_eq "routes: corrupted line, nft side still fails" "$H_RC" 1
+assert_eq "routes: corrupted line gives no rule for it" "$(rrules | grep -c -e "to 999" -e not-an-ip || true)" 0
+assert_contains "routes: the valid address still has its rule" "$(rrules)" "to 203.0.113.10 lookup main"
+assert_contains "routes: corrupted line is reported" "$H_OUT" "ignoring invalid address"
+h set 203.0.113.10
+# DNS fallback also produces the rule
+if getent ahosts localhost 2>/dev/null | awk '$2=="STREAM" && $1 ~ /^[0-9.]+$/ {f=1} END {exit !f}'; then
+    h set localhost
+    h clear-routes
+    VKS_RESOLVE_FAIL=localhost hs set localhost
+    assert_eq "routes: DNS fallback exit status" "$H_RC" 0
+    assert_contains "routes: DNS fallback gives the rule" "$(rrules)" "to 127.0.0.1 lookup main"
+fi
+# the kill switch table is not loaded: the rules are still synchronised
+nft delete table inet killswitch
+h clear-routes
+h set 203.0.113.10 198.51.100.7
+assert_eq "routes, table not loaded: set exits 0" "$H_RC" 0
+assert_eq "routes, table not loaded: two rules" "$(nrules)" 2
+h clear-routes
+h apply
+assert_eq "routes, table not loaded: apply exits 0" "$H_RC" 0
+assert_contains "routes, table not loaded: message" "$H_OUT" "Kill switch is not active; nothing to apply."
+assert_eq "routes, table not loaded: apply recreated the rules" "$(nrules)" 2
+load_table
+
+# the routing effect, with a Hiddify-like situation made of dummy interfaces
+if ip link add tun9 type dummy 2>/dev/null; then
+    ip addr add 172.19.0.1/28 dev tun9
+    ip link set tun9 up
+    ip route add default dev tun9 table 2022
+    ip rule add pref 9003 from all iif lo lookup 2022
+    ip link add wl9 type dummy
+    ip addr add 192.168.9.2/24 dev wl9
+    ip link set wl9 up
+    ip route add default via 192.168.9.1 dev wl9
+    h clear-routes
+    assert_contains "routing effect: before set, traffic goes into the tunnel" "$(ip route get 203.0.113.10 2>&1)" "dev tun9"
+    h set 203.0.113.10
+    assert_contains "routing effect: after set, traffic uses the main table" "$(ip route get 203.0.113.10 2>&1)" "dev wl9"
+    assert_contains "routing effect: other destinations still use the tunnel" "$(ip route get 203.0.113.99 2>&1)" "dev tun9"
+    VKS_CGROUP_ROOT=$EMPTY_CG h set-hiddify
+    assert_contains "routing effect: after set-hiddify, tunnel again" "$(ip route get 203.0.113.10 2>&1)" "dev tun9"
+    ip rule del pref 9003
+    ip link del tun9
+    ip link del wl9
+else
+    echo "note: 'ip link add type dummy' is not available here, the routing effect is not tested"
+fi
+h clear-routes
+ip -4 rule del pref 9000 to 192.0.2.1 lookup main
+h set 1.2.3.4
 
 # ---- the kill switch table is not loaded
 nft delete table inet killswitch

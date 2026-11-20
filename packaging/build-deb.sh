@@ -47,6 +47,7 @@ FILES=(
     "vpn-killswitch-server.sh|usr/sbin/vpn-killswitch-server|0755"
     "vpn-killswitch.service|usr/lib/systemd/system/vpn-killswitch.service|0644"
     "vpn-killswitch-hiddify.service|usr/lib/systemd/system/vpn-killswitch-hiddify.service|0644"
+    "vpn-killswitch-apply.service|usr/lib/systemd/system/vpn-killswitch-apply.service|0644"
     "tray/vpn-tray.service|usr/lib/systemd/user/vpn-tray.service|0644"
     "watchdog/vpn-watchdog.service|usr/lib/systemd/user/vpn-watchdog.service|0644"
     "killswitch.nft|etc/nftables.d/killswitch.nft|0644"
@@ -93,7 +94,7 @@ trap 'rm -rf "$TMP"' EXIT
 PYTHONPYCACHEPREFIX="$TMP/pycache" python3 -m py_compile tray/vpn-tray.py \
     || die "py_compile failed: tray/vpn-tray.py"
 
-for u in vpn-killswitch.service vpn-killswitch-hiddify.service tray/vpn-tray.service watchdog/vpn-watchdog.service; do
+for u in vpn-killswitch.service vpn-killswitch-hiddify.service vpn-killswitch-apply.service tray/vpn-tray.service watchdog/vpn-watchdog.service; do
     if grep -q '@' "$u"; then
         die "unit $u still contains '@' placeholders"
     fi

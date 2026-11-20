@@ -20,6 +20,13 @@ if [ -d /run/systemd/system ]; then
     # ExecStop deletes the nftables table.
     systemctl disable --now vpn-killswitch.service >/dev/null 2>&1 || true
     systemctl disable --now vpn-killswitch-hiddify.service >/dev/null 2>&1 || true
+    # ExecStop removes the routing rules (pref 8999).
+    systemctl disable --now vpn-killswitch-apply.service >/dev/null 2>&1 || true
+fi
+# Remove the routing rules in any case: the unit's ExecStop only runs when the unit
+# was active, and the rules may have been added by another path (set, apply).
+if [ -x /usr/sbin/vpn-killswitch-server ]; then
+    /usr/sbin/vpn-killswitch-server clear-routes >/dev/null 2>&1 || true
 fi
 
 exit 0

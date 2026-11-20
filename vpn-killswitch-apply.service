@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+# Restores the policy-routing exception (pref 8999, "to <VPN server> lookup main")
+# at boot, even when the kill switch itself is disabled: without it a VPN profile
+# cannot connect while Hiddify routes everything into its tunnel. When the kill
+# switch is enabled, its own ExecStartPost has already applied everything and this
+# unit is a harmless repeat. Stopping the unit removes the rules.
+[Unit]
+Description=VPN kill switch: routing exception for the VPN server addresses
+After=vpn-killswitch.service network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/vpn-killswitch-server apply
+ExecStop=/usr/sbin/vpn-killswitch-server clear-routes
+
+[Install]
+WantedBy=multi-user.target

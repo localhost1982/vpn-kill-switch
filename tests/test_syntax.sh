@@ -81,7 +81,7 @@ fi
 
 # unit files: no unsubstituted placeholders, the expected sections
 mapfile -t UNITS < <(find "$ROOT" \( -path "$ROOT/.git" -o -path "$ROOT/dist" \) -prune -o -name '*.service' -type f -print | sort)
-((${#UNITS[@]} >= 4)) && pass || fail "expected at least 4 unit files, found ${#UNITS[@]}"
+((${#UNITS[@]} >= 5)) && pass || fail "expected at least 5 unit files, found ${#UNITS[@]}"
 for f in "${UNITS[@]}"; do
     if grep -nE '@[A-Za-z0-9_]*@|^[^#]*@' "$f" >"$TEST_TMP/err"; then
         fail "$(rel "$f") contains an @ placeholder: $(<"$TEST_TMP/err")"
@@ -96,6 +96,15 @@ done
 for u in vpn-killswitch.service vpn-killswitch-hiddify.service; do
     grep -q '/usr/sbin/vpn-killswitch-server' "$ROOT/$u" && pass || fail "$u does not call /usr/sbin/vpn-killswitch-server"
 done
+grep -q 'vpn-killswitch-server apply' "$ROOT/vpn-killswitch-apply.service" && pass || fail "apply unit does not run 'vpn-killswitch-server apply'"
+grep -q 'vpn-killswitch-server clear-routes' "$ROOT/vpn-killswitch-apply.service" && pass || fail "apply unit does not run 'vpn-killswitch-server clear-routes'"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    # the helper path does not exist on a development machine: only complain about the unit itself
+    out=$(systemd-analyze verify "$ROOT/vpn-killswitch-apply.service" 2>&1 | grep -v -e '/usr/sbin/vpn-killswitch-server' -e 'is not executable' -e 'not found')
+    if [[ -z $out ]]; then pass; else fail "systemd-analyze verify vpn-killswitch-apply.service: $out"; fi
+else
+    echo "note: systemd-analyze is not installed, the apply unit is not verified"
+fi
 grep -q 'vpn-tray.py' "$ROOT/tray/vpn-tray.service" && pass || fail "tray unit does not start vpn-tray.py"
 grep -q 'vpn-watchdog.sh' "$ROOT/watchdog/vpn-watchdog.service" && pass || fail "watchdog unit does not start vpn-watchdog.sh"
 # the Hiddify unit must not be enabled by the package itself (the helper does that)

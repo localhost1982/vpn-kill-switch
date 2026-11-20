@@ -15,7 +15,7 @@ the kill switch allows (the VPN server addresses, or the Hiddify service) at run
 
 Repository: <https://github.com/localhost1982/vpn-kill-switch>
 
-Download: [vpn-kill-switch_1.1.0_all.deb](https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.1.0/vpn-kill-switch_1.1.0_all.deb)
+Download: [vpn-kill-switch_1.1.1_all.deb](https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.1.1/vpn-kill-switch_1.1.1_all.deb)
 (the latest version is always on the [Releases page](https://github.com/localhost1982/vpn-kill-switch/releases/latest)).
 What changed between versions: [CHANGELOG.md](CHANGELOG.md).
 
@@ -52,7 +52,8 @@ The repository:
 | `killswitch.nft` | Generic nftables rules, with the empty chain `vpn_allow` that the helper fills. |
 | `vpn-killswitch.service` | systemd unit that loads the rules before the network comes up and fills the exceptions after it. |
 | `vpn-killswitch-hiddify.service` | systemd unit that refreshes the kill switch rule for the Hiddify service each time it starts. Enabled only in the Hiddify mode. |
-| `vpn-killswitch-server.sh` | Root helper that fills the chain `vpn_allow`: the VPN server addresses (`set`) or the Hiddify service (`set-hiddify`). Also `apply`, `refresh` and `show`. |
+| `vpn-killswitch-apply.service` | systemd unit that restores the routing exception for the VPN server addresses at boot, even when the kill switch is disabled. |
+| `vpn-killswitch-server.sh` | Root helper that fills the chain `vpn_allow`: the VPN server addresses (`set`) or the Hiddify service (`set-hiddify`), and keeps the routing exception for the VPN servers. Also `apply`, `refresh`, `show` and `clear-routes`. |
 | `vpn-stats.sh` | Statistics of VPN drops and internet outages of the selected profile for the last N hours. |
 | `tray/vpn-tray.py` | VPN icon in the GNOME top bar with a statistics menu, VPN drop notifications and the Settings window (VPN profile, kill switch, watchdog, notifications). |
 | `tray/vpn-tray.service` | `systemd --user` unit that starts the icon after you log in to the session. |
@@ -76,6 +77,7 @@ Installed as (the layout is defined in `packaging/build-deb.sh`):
 | `killswitch.nft` | `/etc/nftables.d/killswitch.nft` (conffile) | 0644 |
 | `vpn-killswitch.service` | `/usr/lib/systemd/system/vpn-killswitch.service` | 0644 |
 | `vpn-killswitch-hiddify.service` | `/usr/lib/systemd/system/vpn-killswitch-hiddify.service` | 0644 |
+| `vpn-killswitch-apply.service` | `/usr/lib/systemd/system/vpn-killswitch-apply.service` | 0644 |
 | `vpn-killswitch-server.sh` | `/usr/sbin/vpn-killswitch-server` | 0755 |
 | `vpn-stats.sh` | `/usr/bin/vpn-stats` | 0755 |
 | `tray/vpn-tray.py` | `/usr/lib/vpn-kill-switch/vpn-tray.py` | 0755 |
@@ -188,7 +190,8 @@ vpn-killswitch-server set HOST [HOST...]   resolve the VPN server host(s); mode 
 vpn-killswitch-server set-hiddify          allow the Hiddify service; mode "hiddify"
 vpn-killswitch-server apply                load the saved state into the rules (no DNS)
 vpn-killswitch-server refresh              re-resolve the saved hosts and apply them
-vpn-killswitch-server show                 show the mode and the current rules
+vpn-killswitch-server show                 show the mode, the nftables rules and the routing rules
+vpn-killswitch-server clear-routes         remove the routing rules (see "The routing exception")
 ```
 
 - Mode `servers` writes one rule with the resolved addresses: `ip daddr { addresses } accept`.
@@ -199,13 +202,20 @@ vpn-killswitch-server show                 show the mode and the current rules
   nothing is configured), `servers` (the host names, one per line) and `addresses` (the resolved IPv4
   addresses, one per line). `set` replaces the saved hosts and addresses; `set-hiddify` changes only the mode.
 - `HOST` is a host name or an IPv4 address. All hosts are validated and resolved first: if one cannot be
-  resolved, nothing is written.
+  resolved, nothing is written, with one exception: if DNS is unavailable and the requested hosts are the same
+  set as the saved ones (in any order) and the saved addresses are valid, `set` keeps the saved hosts and
+  addresses, switches the mode to `servers`, applies them and prints `DNS lookup failed for HOST; using the
+  saved addresses.` on stderr (exit 0). IPv4 addresses never need DNS.
+- `refresh` in the mode `servers` behaves the same way when a lookup fails: it keeps the saved addresses, applies
+  them and prints `DNS lookup failed for HOST; keeping the saved addresses.` on stderr (exit 0); without saved
+  addresses it fails with exit 3.
 - `apply` does no DNS lookups, so it also works at early boot. The chain is replaced in one `nft`
   transaction; if nft rejects the rules, the previous rules stay in place.
 - Exit codes: 0 ok, 1 general error, 2 invalid usage or host, 3 cannot resolve a host,
   4 nft rejected the new rules.
 - For testing without root: `VKS_PREFIX=/some/dir` is prepended to all `/etc` paths and
-  `VKS_DRY_RUN=1` skips the root check and `systemctl` and prints the rules instead of loading them.
+  `VKS_DRY_RUN=1` skips the root check and `systemctl` and prints the rules and the `ip` commands instead of running them;
+  `VKS_RESOLVE_FAIL="host1 host2"` makes the lookup of the listed hosts fail (simulates unavailable DNS).
 
 The tray runs `sudo -n /usr/sbin/vpn-killswitch-server set HOST...` when you save a NetworkManager profile,
 and `set-hiddify` when you save Hiddify (see "Settings" and "Hiddify"). You can run the helper by hand with `sudo`.
@@ -225,6 +235,45 @@ loaded, so the rules file cannot contain it. Instead:
 **An empty chain blocks.** If nothing is configured, or the Hiddify service is not running, `vpn_allow` is
 empty and everything outside the tunnel interfaces is blocked, except the local network. So the kill switch
 can always be loaded, with or without a configured VPN.
+
+### The routing exception
+
+Besides the nftables chain, in the mode `servers` the helper keeps one policy-routing rule for every saved VPN
+server address:
+
+```
+ip -4 rule add pref 8999 to <ADDRESS>/32 lookup main
+```
+
+**Why.** In its VPN (TUN) mode Hiddify (sing-box) installs routing rules with priorities 9000 to 9010 that send all
+locally generated traffic into its tunnel `tun0`. If you select a NetworkManager VPN profile while Hiddify is still
+connected, the VPN's own packets to its server (IKE, ESP, L2TP) would go into the Hiddify tunnel too. In the mode
+`servers` the kill switch allows only the VPN server address outside the tunnels, not Hiddify's traffic, so Hiddify
+is blocked and the VPN cannot come up through it: a circular dependency. The rule with priority 8999 comes before
+Hiddify's rules and makes the traffic to the VPN server always use the main routing table, that is, the real
+network.
+
+**When.** Every `apply` (and so `set`, `set-hiddify`, `refresh`, the `ExecStartPost` of
+`vpn-killswitch.service` and the Hiddify hook unit) first makes the set of rules with priority 8999 equal to the
+wanted one: in the mode `servers` one rule per saved address; in the mode `hiddify`, or when nothing is configured,
+none. This happens also when the kill switch (the nftables table) is not loaded, because the exception is useful
+without it too. The rules are IPv4 only, like the `addresses` file. Rules with other priorities are never touched.
+If `ip` fails, the helper prints a warning and continues.
+
+**See it.**
+
+```bash
+ip -4 rule show pref 8999
+sudo vpn-killswitch-server show
+```
+
+`show` lists the rules under `Routing rules (pref 8999):` (or `none`).
+
+**Boot and removal.** Routing rules do not survive a reboot. `vpn-killswitch-apply.service` (enabled by the
+package) runs `vpn-killswitch-server apply` at boot, so the exception is restored even when the kill switch itself
+is disabled; when the kill switch is enabled, its own unit has already applied everything and this is a harmless
+repeat. Stopping that unit, and the `prerm` script on removal, runs `vpn-killswitch-server clear-routes`, which
+deletes the rules with priority 8999.
 
 ### Why not `nftables.service`
 
@@ -255,24 +304,24 @@ Either download `vpn-kill-switch_<version>_all.deb` from the
 [Releases page](https://github.com/localhost1982/vpn-kill-switch/releases/latest) of the repository, or build it
 yourself (see "Building the package"). The package is architecture-independent (`all`).
 
-The current release is 1.1.0:
-[vpn-kill-switch_1.1.0_all.deb](https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.1.0/vpn-kill-switch_1.1.0_all.deb).
+The current release is 1.1.1:
+[vpn-kill-switch_1.1.1_all.deb](https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.1.1/vpn-kill-switch_1.1.1_all.deb).
 From a terminal:
 
 ```bash
-wget https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.1.0/vpn-kill-switch_1.1.0_all.deb
+wget https://github.com/localhost1982/vpn-kill-switch/releases/download/v1.1.1/vpn-kill-switch_1.1.1_all.deb
 ```
 
 Each release lists the SHA-256 checksum of its file; compare it with the downloaded one:
 
 ```bash
-sha256sum vpn-kill-switch_1.1.0_all.deb
+sha256sum vpn-kill-switch_1.1.1_all.deb
 ```
 
 ### 2. Install it
 
 ```bash
-sudo apt install ./vpn-kill-switch_1.1.0_all.deb
+sudo apt install ./vpn-kill-switch_1.1.1_all.deb
 ```
 
 The `./` is needed: it tells apt that the argument is a file. apt also installs the dependencies.
@@ -402,7 +451,7 @@ systemctl status vpn-killswitch.service
 
 ### From 1.0.x
 
-Installing 1.1.0 over 1.0.x needs no preparation: `sudo apt install ./vpn-kill-switch_1.1.0_all.deb`.
+Installing 1.1.1 over 1.0.x needs no preparation: `sudo apt install ./vpn-kill-switch_1.1.1_all.deb`.
 The `postinst` script migrates the VPN server addresses automatically:
 
 - the addresses from the old generated file `/etc/nftables.d/killswitch-server.nft` are moved to
@@ -484,7 +533,7 @@ The result is `dist/vpn-kill-switch_<version>_all.deb` (the `dist/` folder is no
 prints `Built: <path>` and the package information (`dpkg-deb -I`). To look inside:
 
 ```bash
-dpkg-deb -c dist/vpn-kill-switch_1.1.0_all.deb
+dpkg-deb -c dist/vpn-kill-switch_1.1.1_all.deb
 ```
 
 **To change the version**, edit the single line in `VERSION` (for example `1.0.1`) and build again. That one
@@ -504,7 +553,9 @@ sudo apt remove vpn-kill-switch
 Before the files are removed, the `prerm` script, for the logged-in users, stops the user units `vpn-tray.service` and
 `vpn-watchdog.service`, removes their global enable (`systemctl --global disable`) and disables the kill switch
 (`systemctl disable --now vpn-killswitch.service`; the unit's `ExecStop` deletes the nftables table) and the Hiddify
-hook unit (`vpn-killswitch-hiddify.service`). Traffic immediately starts flowing without restrictions. The configuration
+hook unit (`vpn-killswitch-hiddify.service`). It also stops `vpn-killswitch-apply.service`, which removes the routing
+rules of the VPN servers (`pref 8999`; without systemd it runs `vpn-killswitch-server clear-routes` directly).
+Traffic immediately starts flowing without restrictions. The configuration
 files stay (the rules, the sudoers drop-in, the state in `/etc/vpn-killswitch/`).
 
 ```bash
@@ -596,6 +647,10 @@ Typical changes:
   nmcli connection modify "My VPN" connection.autoconnect yes
   ```
 
+- **Do not list the VPN in `connection.secondaries`.** If a Wi-Fi or Ethernet profile names the VPN there,
+  NetworkManager starts the VPN itself on every connect and may reconnect the Wi-Fi when the VPN fails. With the
+  kill switch the watchdog does the reconnecting, so the setting is unnecessary; see "Troubleshooting",
+  "Wi-Fi keeps reconnecting, or the VPN starts by itself".
 - **Dead tunnel detection.** By default pppd does not check whether the link is alive,
   and a hung VPN stays hung forever. For pppd-based profiles (L2TP, PPTP), to make NetworkManager
   drop it on its own after about half a minute:
@@ -1082,12 +1137,21 @@ profile.
 the subtitle `Not used with Hiddify: it reconnects by itself.`, and the watchdog idles: it brings up neither a
 NetworkManager profile nor Hiddify.
 
+**Before you switch.** Make sure that no Wi-Fi or Ethernet profile lists a VPN in `connection.secondaries`: with
+Hiddify selected the kill switch blocks that VPN's server, so NetworkManager keeps retrying and resetting the
+Wi-Fi (see "Troubleshooting", "Wi-Fi keeps reconnecting, or the VPN starts by itself").
+
 **Back to a NetworkManager profile.** Choose the profile in `VPN connection` and press `Save`. Step 1 runs
 `set HOST...` as usual, the settings are saved with `backend = nm`, and `nmcli connection up` brings the profile up.
 Hiddify is not touched.
 
-**Hiddify on top of a VPN.** Hiddify also works without being selected in the tray: if a NetworkManager VPN (for
-example L2TP) is up, Hiddify sends its own traffic through that tunnel, and the kill switch does not interfere.
+**Hiddify on top of a VPN.** Hiddify also works without being selected in the tray, in both orders: you can start
+it before or after a NetworkManager VPN (for example L2TP/IPsec). This works because of the routing exception (see
+"The exceptions: the `vpn_allow` chain", "The routing exception"): the helper keeps the rule `pref 8999 to <server>
+lookup main` for the VPN server, which comes before Hiddify's own routing rules, so the VPN always connects
+directly and not through the Hiddify tunnel. While the VPN is up, Hiddify's traffic goes through the VPN tunnel and
+the kill switch does not interfere. While the VPN is down, Hiddify has no path in the mode `servers` (the kill
+switch blocks its traffic) and resumes by itself when the VPN is back.
 
 **Tunnel interface.** The name of the tunnel that Hiddify creates is `tun0` by default. If yours differs, set it in
 the settings file:
@@ -1175,6 +1239,20 @@ user cannot read the kernel journal: add yourself to the `adm` group and log in 
 although the counter grows, the loaded rules have no `log` rules (for example an edited or an old rules file): check
 that `/etc/nftables.d/killswitch.nft` contains them and run `sudo systemctl reload vpn-killswitch.service`.
 
+**The VPN does not connect while Hiddify is running.** The VPN's packets to its server must not enter the Hiddify
+tunnel; the helper keeps a routing rule for that (see "The routing exception"). Check that the rule lists the
+server address, and that the route to the server does not go to `tun0`:
+
+```bash
+ip -4 rule show pref 8999
+ip route get <server IP>
+```
+
+The first command must list `to <server IP> lookup main`, and the second must not say `dev tun0`. If the rule is
+missing, check the mode with `sudo vpn-killswitch-server show` (the rule exists only in the mode `servers`; choose
+the VPN profile in Settings and press `Save` if it says `Hiddify`) and put the rule back with
+`sudo vpn-killswitch-server apply`.
+
 **Hiddify does not connect with the kill switch on.** Check the mode and the Hiddify service:
 
 ```bash
@@ -1231,6 +1309,22 @@ With the VPN on, check that the default route points to the tunnel interface:
 **The rules disappeared after a reboot.** Check that the service is enabled:
 `systemctl is-enabled vpn-killswitch.service`. If you enabled `nftables.service`,
 its `flush ruleset` deletes the table. Disable it or remove `flush ruleset`.
+
+**Wi-Fi keeps reconnecting, or the VPN starts by itself.** If a Wi-Fi or Ethernet profile lists the VPN in
+`connection.secondaries`, NetworkManager starts that VPN itself on every connect and, when the VPN cannot come up,
+fails and reconnects the Wi-Fi as well. With this project the setting is unnecessary (the watchdog reconnects
+the selected profile), and with Hiddify selected it is harmful: the kill switch blocks the VPN server, so
+NetworkManager keeps retrying and resetting the Wi-Fi. Check the profile:
+
+```bash
+nmcli -g connection.secondaries connection show "<wifi profile>"
+```
+
+If it prints a VPN, remove the setting:
+
+```bash
+nmcli connection modify "<wifi profile>" connection.secondaries ""
+```
 
 ## License
 
